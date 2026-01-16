@@ -112,22 +112,67 @@ _k_msg: lda kernal_ok_msg,x
         bne _k_msg
 _k_done:
 
+        ; TEST: Verify KERNAL file loaded to $8000 correctly
+        ; First 2 bytes should be $E0 $02
+        lda #'l'
+        jsr CHROUT
+        lda #'d'
+        jsr CHROUT
+        lda #'='
+        jsr CHROUT
+        lda $8000
+        jsr print_hex8
+        lda $8001
+        jsr print_hex8
+        lda #' '
+        jsr CHROUT
+
         ; use DMA to copy the bytes
         ; 8000 -> C000 (kernel) in bank 4
         lda #$00
-        sta DMA_REG
+        sta $D707
         .byte $80                       ; enhanced dma - src bits 20-27
-        .byte $00   ; src hi
+        .byte $00                       ; src MB
         .byte $81                       ; enhanced dma - dest bits 20-27
-        .byte $00   ; dest hi
+        .byte $00                       ; dest MB
         .byte $00                       ; end of job options
         .byte $00                       ; copy                                 
-        .byte $00       ; <\length,
-        .byte $40       ; >\length      ; length lsb, msb
+        .byte $00, $40                  ; length lsb, msb = $4000
         .byte $00, $80, $00             ; src lsb, msb, bank 0
         .byte $00, $C0, $04             ; dest lsb, msb, bank 4
         .byte $00                       ; command high byte
         .word $0000                     ; modulo (ignored)
+
+        ; TEST: Verify KERNAL copy worked - read first 2 bytes from bank 4 $C000
+        ; The KERNAL starts with $E0 $02
+        lda #'k'
+        jsr CHROUT
+        lda #'='
+        jsr CHROUT
+        
+        ; First, put marker bytes at $4000 to verify DMA writes
+        lda #$AA
+        sta $4000
+        lda #$55
+        sta $4001
+        
+        ; DMA copy 2 bytes from bank 4 $C000 to $4000 bank 0
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00   ; options
+        .byte $00                       ; copy
+        .word $0002                     ; count = 2
+        .byte $00, $C0, $04             ; src: $C000, bank 4
+        .byte $00, $40, $00             ; dst: $4000, bank 0
+        .byte $00
+        .word $0000
+        
+        lda $4000
+        jsr print_hex8
+        lda $4001
+        jsr print_hex8
+        lda #' '
+        jsr CHROUT
 
         ; ----------------------------------------------------
         ; 2) Load BASIC ROM to $8000
@@ -162,22 +207,57 @@ _b_done:
         ; use DMA to copy the bytes
         ; 8000 -> 48000 (basic ROM)
         lda #$00
-        sta DMA_REG
+        sta $D707
         .byte $80                       ; enhanced dma - src bits 20-27
-        .byte $00   ; src hi
+        .byte $00                       ; src MB
         .byte $81                       ; enhanced dma - dest bits 20-27
-        .byte $00   ; dest hi
+        .byte $00                       ; dest MB
         .byte $00                       ; end of job options
         .byte $00                       ; copy                                 
-        .byte $00       ; <\length,
-        .byte $40       ; >\length      ; length lsb, msb
+        .byte $00, $40                  ; length lsb, msb = $4000
         .byte $00, $80, $00             ; src lsb, msb, bank 0
         .byte $00, $80, $04             ; dest lsb, msb, bank 4
         .byte $00                       ; command high byte
         .word $0000                     ; modulo (ignored)
 
         ; ----------------------------------------------------
-        ; 3) Initialize memory system (clears Plus/4 RAM in bank 4)
+        ; TEST: Direct DMA read from bank 4, page $FF to $C000
+        ; This bypasses P4MEM to verify the ROM data is there
+        ; ----------------------------------------------------
+        lda #'t'
+        jsr CHROUT
+        lda #'s'
+        jsr CHROUT
+        lda #'t'
+        jsr CHROUT
+        lda #'='
+        jsr CHROUT
+        
+        ; DMA copy 256 bytes from bank 4 $FF00 to bank 0 $4000
+        lda #$00
+        sta $D707
+        .byte $80                ; enhanced dma - src MB
+        .byte $00                ; src MB = 0
+        .byte $81                ; enhanced dma - dest MB
+        .byte $00                ; dest MB = 0
+        .byte $00                ; end of options
+        .byte $00                ; command = copy
+        .word $0100              ; count = 256
+        .byte $00, $FF, $04      ; src: $FF00, bank 4
+        .byte $00, $40, $00      ; dst: $4000, bank 0
+        .byte $00                ; cmd hi
+        .word $0000              ; modulo
+        
+        ; Now read $40FC and $40FD (should be reset vector)
+        lda $40FD                ; High byte
+        jsr print_hex8
+        lda $40FC                ; Low byte  
+        jsr print_hex8
+        lda #$0D
+        jsr CHROUT
+
+        ; ----------------------------------------------------
+        ; 3) Initialize memory system (clears Plus/4 RAM in bank 5)
         ; ----------------------------------------------------
         ldx #0
 _init_msg:
@@ -228,7 +308,7 @@ _ready_done:
         lda #$0D
         jsr CHROUT
 
-rts
+;rts
 
         ; Wait for keypress
         ldx #0
@@ -259,7 +339,7 @@ _wait:
         jsr P4CPU_Reset
         
 main_loop:
-        jsr output_emulator_steps
+        ;jsr output_emulator_steps
         jsr P4CPU_Step
         jmp main_loop
 
