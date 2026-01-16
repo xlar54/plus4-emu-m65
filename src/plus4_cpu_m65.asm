@@ -22,6 +22,7 @@ p4_tmp      = $0e
 p4_tmp2     = $0f
 p4_cycles   = $10
 p4_xtra     = $11
+p4_dec_a    = $12           ; Saved A for decimal mode ADC/SBC
 p4_inst_pc_lo = $1A
 p4_inst_pc_hi = $1B
 p4_irq_pending = $19
@@ -600,17 +601,109 @@ _br_same:
         sta p4_pc_hi
         rts
 
-; --- do_adc ---
+; --- do_adc ---  (supports decimal mode when P_D set)
 do_adc:
         sta p4_tmp
+
+        ; If D flag clear -> original binary path
+        lda p4_p
+        and #P_D
+        beq _do_adc_bin
+
+        ; ---------- decimal ADC ----------
+        ; Save original A
+        lda p4_a
+        sta p4_dec_a
+
+        ; carry_in -> p4_vec_lo (0/1)
+        lda p4_p
+        and #P_C
+        beq _adc_dec_c0
+        lda #1
+        bne _adc_dec_cstore
+_adc_dec_c0:
+        lda #0
+_adc_dec_cstore:
+        sta p4_vec_lo
+
+        ; Binary add first (for V computation)
+        lda p4_vec_lo
+        beq _adc_dec_clc
+        sec
+        bne _adc_dec_go
+_adc_dec_clc:
+        clc
+_adc_dec_go:
+        lda p4_dec_a
+        adc p4_tmp
+        sta p4_a
+        php                     ; save binary flags (esp V)
+
+        ; Low nibble adjust test: (A_lo + M_lo + carry_in) > 9 ?
+        lda p4_tmp
+        and #$0F
+        sta p4_tmp2             ; m_lo
+        lda p4_dec_a
+        and #$0F
+        clc
+        adc p4_tmp2
+        clc
+        adc p4_vec_lo           ; + carry_in (0/1)
+        cmp #$0A
+        bcc _adc_dec_no6
+        lda p4_a
+        clc
+        adc #$06
+        sta p4_a
+_adc_dec_no6:
+
+        ; High adjust if result >= $9A (i.e., > 99 in BCD)
+        lda #0
+        sta p4_vec_hi           ; decimal carry out (0/1)
+        lda p4_a
+        cmp #$9A
+        bcc _adc_dec_no60
+        clc
+        adc #$60
+        sta p4_a
+        lda #1
+        sta p4_vec_hi
+_adc_dec_no60:
+
+        ; Restore binary flags for V via PLP, then rebuild p4_p C/V
+        plp
+        lda p4_p
+        and #(~(P_C|P_V)) & $ff
+        sta p4_p
+
+        ; C from decimal carry (p4_vec_hi)
+        lda p4_vec_hi
+        beq _adc_dec_noc
+        lda p4_p
+        ora #P_C
+        sta p4_p
+_adc_dec_noc:
+
+        ; V from binary add (host V flag after PLP)
+        bvc _adc_dec_nov
+        lda p4_p
+        ora #P_V
+        sta p4_p
+_adc_dec_nov:
+        lda p4_a
+        jsr set_zn_a
+        rts
+
+_do_adc_bin:
+        ; ---------- your original binary ADC ----------
         lda p4_p
         and #P_C
         beq _adc_nc
         sec
-        jmp _adc_go
+        jmp _adc_go2
 _adc_nc:
         clc
-_adc_go:
+_adc_go2:
         lda p4_a
         adc p4_tmp
         sta p4_a
@@ -619,31 +712,150 @@ _adc_go:
         and #(~(P_C|P_V)) & $ff
         sta p4_p
         plp
-        bcc _adc_noc
+        bcc _adc_noc2
         lda p4_p
         ora #P_C
         sta p4_p
-_adc_noc:
-        bvc _adc_nov
+_adc_noc2:
+        bvc _adc_nov2
         lda p4_p
         ora #P_V
         sta p4_p
-_adc_nov:
+_adc_nov2:
         lda p4_a
         jsr set_zn_a
         rts
 
-; --- do_sbc ---
+
+; --- do_sbc --- (supports decimal mode when P_D set)
 do_sbc:
         sta p4_tmp
+
+        ; If D flag clear -> original binary path
+        lda p4_p
+        and #P_D
+        beq _do_sbc_bin
+
+        ; ---------- decimal SBC ----------
+        ; Save original A
+        lda p4_a
+        sta p4_dec_a
+
+        ; carry_in (C=1 means no borrow) -> p4_vec_lo (0/1)
+        lda p4_p
+        and #P_C
+        beq _sbc_dec_c0
+        lda #1
+        bne _sbc_dec_cstore
+_sbc_dec_c0:
+        lda #0
+_sbc_dec_cstore:
+        sta p4_vec_lo
+
+        ; Binary subtract first (for V computation)
+        lda p4_vec_lo
+        beq _sbc_dec_clc
+        sec
+        bne _sbc_dec_go
+_sbc_dec_clc:
+        clc
+_sbc_dec_go:
+        lda p4_dec_a
+        sbc p4_tmp
+        sta p4_a
+        php                     ; save binary flags (esp V)
+
+        ; Save binary carry-out (no borrow) into p4_vec_hi (0/1)
+        bcc _sbc_dec_borrow
+        lda #1
+        bne _sbc_dec_cout_store
+_sbc_dec_borrow:
+        lda #0
+_sbc_dec_cout_store:
+        sta p4_vec_hi
+
+        ; Low nibble adjust:
+        ; if (A_lo - M_lo - (1-Cin)) < 0 then subtract 6
+        lda p4_tmp
+        and #$0F
+        sta p4_tmp2             ; m_lo
+
+        ; borrow_in = 1 - Cin
+        lda #1
+        sec
+        sbc p4_vec_lo           ; -> 1 if Cin=0 else 0
+        tay                     ; Y = borrow_in (0/1)
+
+        lda p4_dec_a
+        and #$0F
+        sec
+        sbc p4_tmp2
+        tya
+        beq _sbc_dec_no_bi
+        sec
+        sbc #$00                ; ensure carry set for next SBC
+_sbc_dec_no_bi:
+        ; We need to subtract borrow_in:
+        ; easiest: redo cleanly:
+        lda p4_dec_a
+        and #$0F
+        sec
+        sbc p4_tmp2
+        tya
+        beq _sbc_dec_chk_lo
+        sec
+        sbc #$01
+_sbc_dec_chk_lo:
+        bpl _sbc_dec_no6
+        lda p4_a
+        sec
+        sbc #$06
+        sta p4_a
+_sbc_dec_no6:
+
+        ; High adjust if binary borrow occurred (carry_out=0): subtract $60
+        lda p4_vec_hi
+        bne _sbc_dec_no60
+        lda p4_a
+        sec
+        sbc #$60
+        sta p4_a
+_sbc_dec_no60:
+
+        ; Restore binary flags for V via PLP, then rebuild p4_p C/V
+        plp
+        lda p4_p
+        and #(~(P_C|P_V)) & $ff
+        sta p4_p
+
+        ; C from binary carry-out (p4_vec_hi): 1=no borrow, 0=borrow
+        lda p4_vec_hi
+        beq _sbc_dec_noc
+        lda p4_p
+        ora #P_C
+        sta p4_p
+_sbc_dec_noc:
+
+        ; V from binary subtract (host V flag after PLP)
+        bvc _sbc_dec_nov
+        lda p4_p
+        ora #P_V
+        sta p4_p
+_sbc_dec_nov:
+        lda p4_a
+        jsr set_zn_a
+        rts
+
+_do_sbc_bin:
+        ; ---------- your original binary SBC ----------
         lda p4_p
         and #P_C
         bne _sbc_c
         clc
-        jmp _sbc_go
+        jmp _sbc_go2
 _sbc_c:
         sec
-_sbc_go:
+_sbc_go2:
         lda p4_a
         sbc p4_tmp
         sta p4_a
@@ -652,16 +864,16 @@ _sbc_go:
         and #(~(P_C|P_V)) & $ff
         sta p4_p
         plp
-        bcc _sbc_noc
+        bcc _sbc_noc2
         lda p4_p
         ora #P_C
         sta p4_p
-_sbc_noc:
-        bvc _sbc_nov
+_sbc_noc2:
+        bvc _sbc_nov2
         lda p4_p
         ora #P_V
         sta p4_p
-_sbc_nov:
+_sbc_nov2:
         lda p4_a
         jsr set_zn_a
         rts
