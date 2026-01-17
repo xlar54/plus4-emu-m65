@@ -66,6 +66,8 @@ p4_save_dd00:     .byte 0
 p4_save_d011:     .byte 0
 p4_save_d016:     .byte 0
 p4_save_d018:     .byte 0
+p4_save_d020:     .byte 0
+p4_save_d021:     .byte 0
 
 ; ============================================================
 ; P4MEM_Init - Initialize memory system
@@ -91,6 +93,12 @@ _clear_ted:
         dex
         bpl _clear_ted
         
+        ; Initialize TED color registers to Plus/4 defaults
+        lda #$F1                ; Default background (white, lum 7)
+        sta ted_regs+$15
+        lda #$EE                ; Default border (light blue)
+        sta ted_regs+$19
+        
         ; Initialize timer to $FFFF (will reload from ted_regs when it underflows)
         lda #$FF
         sta ted_timer1_lo
@@ -108,15 +116,17 @@ _clear_ted:
         rts
 
 ; ============================================================
-; P4MEM_ClearRAM - Clear all Plus/4 RAM (Bank 5)
+; P4MEM_ClearRAM - Initialize Plus/4 RAM (Bank 5) with pattern
+; Real Plus/4 has random data at startup - we use a pattern
 ; ============================================================
 P4MEM_ClearRAM:
+        ; Fill with $AA pattern (alternating bits) to simulate uninitialized RAM
         lda #$00
         sta $D707
         .byte $80, $00, $81, $00, $00   ; enhanced DMA options
         .byte $03                       ; fill
         .word $0000                     ; count (0 = 64K)
-        .word $0000                     ; fill with $00
+        .word $AA55                     ; fill with $AA,$55 pattern
         .byte $00                       ; unused
         .word $0000                     ; dest start
         .byte BANK_RAM                  ; dest bank 5
@@ -184,6 +194,10 @@ _read_high_memory:
         ; TED registers $FF00-$FF1F
         cmp #$08
         beq _read_keyboard
+        cmp #$15
+        beq _read_ff15
+        cmp #$19
+        beq _read_ff19
         cmp #$1C
         beq _read_raster_lo
         cmp #$1D
@@ -191,6 +205,18 @@ _read_high_memory:
         
         tax
         lda ted_regs,x
+        rts
+
+_read_ff15:
+        ; Background color - TED returns bit 7 set
+        lda ted_regs+$15
+        ora #$80
+        rts
+
+_read_ff19:
+        ; Border color - TED returns bit 7 set
+        lda ted_regs+$19
+        ora #$80
         rts
 
 _read_keyboard:
@@ -457,7 +483,9 @@ _write_not_ff3e:
         cpx #$0D
         bne _ted_write_done
 _ted_cursor_changed:
+        phx                     ; Save X before calling UpdateCursor
         jsr P4VID_UpdateCursor
+        plx                     ; Restore X
 _ted_write_done:
 ; END BLINKING CURSOR OVERLAY
 
@@ -835,6 +863,10 @@ P4VID_EnableHostBitmap:
         sta p4_save_d016
         lda $D018
         sta p4_save_d018
+        lda $D020
+        sta p4_save_d020
+        lda $D021
+        sta p4_save_d021
 
         ; Select VIC bank 1 ($4000-$7FFF): CIA2 $DD00 bits 1..0 = %10 (inverted scheme)
         lda $DD00
@@ -855,26 +887,38 @@ P4VID_EnableHostBitmap:
         ora #$20
         sta $D011
 
-        ; Clear bitmap ($6000..$7F3F = 8000 bytes)
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $03
-        .word $1F40
-        .word $0000
-        .byte $00
-        .word $6000
-        .byte $00
-        .byte $00
-        .word $0000
+        ; Build screen color byte: fg in high nybble, bg in low nybble
+        ; Get current background color (already converted to C64)
+        lda $D021
+        and #$0F
+        sta _scr_fill_color
+        
+        ; Get foreground from Plus/4 TCOLOR ($07ED) 
+        ; Read from LOW_RAM_BUFFER + $7ED = $87ED
+        lda $87ED
+        and #$7F                ; Get TED color (0-127)
+        tax
+        lda ted_to_c64_color,x  ; Convert to C64 color
+        and #$0F
+        asl
+        asl
+        asl
+        asl                     ; Shift to high nybble
+        ora _scr_fill_color
+        sta _scr_fill_color
+        sta _scr_fill_color+1   ; DMA fill uses word
 
-        ; Fill screen matrix ($4800..$4BE7 = 1000 bytes) with $10 (white on black)
+        ; Don't clear bitmap here - let RenderHiresBitmap copy actual Plus/4 data
+        ; GRAPHIC 1,1 clears in Plus/4 RAM, GRAPHIC 1,0 preserves existing data
+
+        ; Fill screen matrix ($4800..$4BE7 = 1000 bytes) with fg/bg color
         lda #$00
         sta $D707
         .byte $80, $00, $81, $00, $00
         .byte $03
         .word $03E8
-        .word $1010
+_scr_fill_color:
+        .word $1010             ; Will be modified above
         .byte $00
         .word $4800
         .byte $00
@@ -901,6 +945,10 @@ P4VID_DisableHostBitmap:
         sta $D016
         lda p4_save_d011
         sta $D011
+        lda p4_save_d020
+        sta $D020
+        lda p4_save_d021
+        sta $D021
         lda #0
         sta p4_host_bmp_on
 _dis_done:
