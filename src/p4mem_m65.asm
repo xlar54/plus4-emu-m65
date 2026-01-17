@@ -54,6 +54,19 @@ p4_cur_prev_hi:   .byte $FF
 p4_cur_phase:     .byte 0     ; 0/1 toggle for blink
 p4_cur_div:       .byte 0     ; frame divider
 
+; --- Video present state (host-side) ---
+; 0=text mirror active, 1=bitmap present active
+p4_video_mode:    .byte 0
+p4_gfx_dirty:     .byte 0
+p4_bmp_hi:        .byte $20   ; default $2000
+
+; Host VIC state save/restore (when flipping to bitmap)
+p4_host_bmp_on:   .byte 0
+p4_save_dd00:     .byte 0
+p4_save_d011:     .byte 0
+p4_save_d016:     .byte 0
+p4_save_d018:     .byte 0
+
 ; ============================================================
 ; P4MEM_Init - Initialize memory system
 ; ============================================================
@@ -369,6 +382,13 @@ P4MEM_Write:
         lda p4_data
 _write_low:
         sta LOW_RAM_BUFFER,x     ; High byte modified
+
+        ; If we're in bitmap present mode, don't mirror text/color to host.
+        lda p4_video_mode
+        beq _mirror_check
+        pla                      ; discard saved page
+        rts
+_mirror_check:
         
         ; Check for mirroring
         pla                      ; Get page back
@@ -440,6 +460,17 @@ _ted_cursor_changed:
         jsr P4VID_UpdateCursor
 _ted_write_done:
 ; END BLINKING CURSOR OVERLAY
+
+        ; Video mode / bitmap base changes (BASIC GRAPHIC uses these)
+        cpx #$06
+        beq _ted_vidchg
+        cpx #$12
+        beq _ted_vidchg
+        cpx #$14
+        bne _ted_viddone
+_ted_vidchg:
+        jsr P4VID_GfxConfigChanged
+_ted_viddone:
         
         cpx #$01
         beq _write_ff01
@@ -601,6 +632,18 @@ _wtram_wr:
         ; Mark buffer as dirty
         lda #1
         sta ram_buf_dirty
+
+        ; If this write hits the active bitmap region, mark frame dirty
+        lda p4_video_mode
+        beq _wtram_done
+        lda p4_addr_hi
+        sec
+        sbc p4_bmp_hi
+        cmp #$20                ; within 8KB window?
+        bcs _wtram_done
+        lda #1
+        sta p4_gfx_dirty
+_wtram_done:
         rts
         
 _wtram_load:
@@ -703,6 +746,183 @@ load_rom_buffer:
 _load_rom_src:
         .byte $00, $00, BANK_ROM        ; src hi byte modified, bank 4
         .byte <ROM_BUFFER, >ROM_BUFFER, $00
+        .byte $00
+        .word $0000
+        rts
+
+; ============================================================
+; Video: bitmap present (simple)
+;
+; This is intentionally minimal: when TED bitmap mode is enabled,
+; we switch the host VIC into standard C64 bitmap mode and DMA-copy
+; the Plus/4 bitmap into the host bitmap at $6000 (VIC bank 1).
+; Colors are forced to white-on-black by filling the host screen
+; matrix with $10.
+; ============================================================
+
+; ------------------------------------------------------------
+; P4VID_GfxConfigChanged
+; Called when TED regs that affect graphics mode/base are written.
+; ------------------------------------------------------------
+P4VID_GfxConfigChanged:
+        ; TED $FF06 bitmap enable is bit 5 (BMM).
+        lda ted_regs+$06
+        and #$20
+        beq _gfx_to_text
+
+        ; Enter bitmap present
+        lda #1
+        sta p4_video_mode
+
+        ; TED $FF12 bits 5..3 select 8KB bitmap page (A15..A13)
+        ; hi byte = (bits 5..3) << 5  => (reg & $38) << 2
+        lda ted_regs+$12
+        and #$38
+        asl
+        asl
+        sta p4_bmp_hi
+
+        lda #1
+        sta p4_gfx_dirty
+        jsr P4VID_EnableHostBitmap
+        rts
+
+_gfx_to_text:
+        lda #0
+        sta p4_video_mode
+        lda #1
+        sta p4_gfx_dirty
+        jsr P4VID_DisableHostBitmap
+        rts
+
+; ------------------------------------------------------------
+; P4VID_Frame
+; Call once per TED frame (we hook this on raster wrap).
+; ------------------------------------------------------------
+P4VID_Frame:
+        lda p4_video_mode
+        beq _pf_done
+        lda p4_gfx_dirty
+        beq _pf_done
+        lda #0
+        sta p4_gfx_dirty
+
+        ; Ensure cached RAM writes are visible in bank 5 before DMA read
+        lda ram_buf_dirty
+        beq _pf_copy
+        jsr flush_ram_buffer
+
+_pf_copy:
+        jsr P4VID_RenderHiresBitmap
+_pf_done:
+        rts
+
+; ------------------------------------------------------------
+; P4VID_EnableHostBitmap
+; Switch host VIC into bitmap mode using VIC bank 1.
+; Screen = $4800, Bitmap = $6000 (absolute addresses).
+; ------------------------------------------------------------
+P4VID_EnableHostBitmap:
+        lda p4_host_bmp_on
+        bne _en_done
+
+        ; Save host VIC/CIA2 state
+        lda $DD00
+        sta p4_save_dd00
+        lda $D011
+        sta p4_save_d011
+        lda $D016
+        sta p4_save_d016
+        lda $D018
+        sta p4_save_d018
+
+        ; Select VIC bank 1 ($4000-$7FFF): CIA2 $DD00 bits 1..0 = %10 (inverted scheme)
+        lda $DD00
+        and #$FC
+        ora #$02
+        sta $DD00
+
+        ; Screen at $0800 within VIC bank1 => $4800 absolute (screen index=2)
+        ; Bitmap at $2000 within VIC bank1 => $6000 absolute (bitmap index=4)
+        lda #$28
+        sta $D018
+
+        ; Hires bitmap: set BMM (D011 bit 5), clear MCM (D016 bit 4)
+        lda $D016
+        and #$EF
+        sta $D016
+        lda $D011
+        ora #$20
+        sta $D011
+
+        ; Clear bitmap ($6000..$7F3F = 8000 bytes)
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03
+        .word $1F40
+        .word $0000
+        .byte $00
+        .word $6000
+        .byte $00
+        .byte $00
+        .word $0000
+
+        ; Fill screen matrix ($4800..$4BE7 = 1000 bytes) with $10 (white on black)
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03
+        .word $03E8
+        .word $1010
+        .byte $00
+        .word $4800
+        .byte $00
+        .byte $00
+        .word $0000
+
+        lda #1
+        sta p4_host_bmp_on
+_en_done:
+        rts
+
+; ------------------------------------------------------------
+; P4VID_DisableHostBitmap
+; Restore saved VIC/CIA2 state.
+; ------------------------------------------------------------
+P4VID_DisableHostBitmap:
+        lda p4_host_bmp_on
+        beq _dis_done
+        lda p4_save_dd00
+        sta $DD00
+        lda p4_save_d018
+        sta $D018
+        lda p4_save_d016
+        sta $D016
+        lda p4_save_d011
+        sta $D011
+        lda #0
+        sta p4_host_bmp_on
+_dis_done:
+        rts
+
+; ------------------------------------------------------------
+; P4VID_RenderHiresBitmap
+; DMA copy Plus/4 bitmap -> host bitmap ($6000).
+; Source: bank 5 at $pp00 where pp = p4_bmp_hi (8KB aligned).
+; ------------------------------------------------------------
+P4VID_RenderHiresBitmap:
+        lda p4_bmp_hi
+        sta _bm_src+1
+
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $00                       ; copy
+        .word $1F40                     ; 8000 bytes
+_bm_src:
+        .byte $00, $20, BANK_RAM        ; src lo/hi/bank (hi patched)
+        .byte $00, $60, $00             ; dst lo/hi/bank 0
         .byte $00
         .word $0000
         rts

@@ -45,27 +45,63 @@ TED_LINES_PER_FRAME = 312   ; PAL has 312 lines
 
 ; --- set_zn_a: set Z and N flags from A ---
 set_zn_a:
-        pha
+;        pha
+;        lda p4_p
+;        and #(~(P_Z|P_N)) & $ff
+;        sta p4_p
+;        pla
+;        pha
+;        beq _set_zn_z
+;        jmp _set_zn_chk_n
+;_set_zn_z:
+;        lda p4_p
+;        ora #P_Z
+;        sta p4_p
+;_set_zn_chk_n:
+;        pla
+;        bmi _set_zn_n
+;        rts
+;_set_zn_n:
+;        lda p4_p
+;        ora #P_N
+ ;       sta p4_p
+;        rts
+
+        pha                     ; preserve A for caller
+        phx                     ; preserve X for caller
+
+        tax                     ; X = result byte (original A)
         lda p4_p
-        and #(~(P_Z|P_N)) & $ff
+        and #(~(P_Z|P_N)) & $ff  ; clear old Z/N
+        ora zn_table,x           ; OR in new Z/N
         sta p4_p
+
+        plx
         pla
-        pha
-        beq _set_zn_z
-        jmp _set_zn_chk_n
-_set_zn_z:
-        lda p4_p
-        ora #P_Z
-        sta p4_p
-_set_zn_chk_n:
-        pla
-        bmi _set_zn_n
         rts
-_set_zn_n:
-        lda p4_p
-        ora #P_N
-        sta p4_p
-        rts
+
+; ------------------------------------------------------------
+; Z/N lookup table: entry = (val==0 ? P_Z : 0) | (val&$80 ? P_N : 0)
+; ------------------------------------------------------------
+zn_table:
+        .byte $02,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+        .byte $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+        .byte $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+        .byte $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+        .byte $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+        .byte $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+        .byte $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+        .byte $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+
+        .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
+        .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
+        .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
+        .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
+        .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
+        .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
+        .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
+        .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
+
 
 ; --- inc_pc ---
 inc_pc:
@@ -346,10 +382,15 @@ _ted_check_wrap:
         bcc _ted_check_irq
         ; Wrap to line 0
         lda #0
+		sta ted_raster_lo
+		sta ted_raster_hi
 
-        ; after:
-        sta ted_raster_lo
-        sta ted_raster_hi
+		; Present video once per frame (bitmap mode uses this)
+		jsr P4VID_Frame
+
+		; Cursor blink only makes sense in text mode
+		lda p4_video_mode
+		bne _no_cur_toggle
 
         inc p4_cur_div
         lda p4_cur_div
@@ -555,24 +596,10 @@ _step_execute:
         
         jsr fetch8
         
-        sta p4_tmp
-        asl
-        sta p4_tmp2
-        lda #0
-        adc #0
-        sta p4_cycles
-        lda #<op_vec
-        clc
-        adc p4_tmp2
-        sta p4_addr_lo
-        lda #>op_vec
-        adc p4_cycles
-        sta p4_addr_hi
-        ldy #$00
-        lda (p4_addr_lo),y
+        tax
+        lda op_vec_lo,x
         sta p4_vec_lo
-        iny
-        lda (p4_addr_lo),y
+        lda op_vec_hi,x
         sta p4_vec_hi
         jmp (p4_vec_lo)
 
@@ -2929,39 +2956,75 @@ op_fb: jmp op_illegal
 op_fc: jmp op_illegal
 op_ff: jmp op_illegal
 
+
 ; ============================================================
-; Opcode vector table (256 entries)
+; Opcode vector tables (split for fast indexing)
 ; ============================================================
-op_vec:
-        .word op_00, op_01, op_02, op_03, op_04, op_05, op_06, op_07
-        .word op_08, op_09, op_0a, op_0b, op_0c, op_0d, op_0e, op_0f
-        .word op_10, op_11, op_12, op_13, op_14, op_15, op_16, op_17
-        .word op_18, op_19, op_1a, op_1b, op_1c, op_1d, op_1e, op_1f
-        .word op_20, op_21, op_22, op_23, op_24, op_25, op_26, op_27
-        .word op_28, op_29, op_2a, op_2b, op_2c, op_2d, op_2e, op_2f
-        .word op_30, op_31, op_32, op_33, op_34, op_35, op_36, op_37
-        .word op_38, op_39, op_3a, op_3b, op_3c, op_3d, op_3e, op_3f
-        .word op_40, op_41, op_42, op_43, op_44, op_45, op_46, op_47
-        .word op_48, op_49, op_4a, op_4b, op_4c, op_4d, op_4e, op_4f
-        .word op_50, op_51, op_52, op_53, op_54, op_55, op_56, op_57
-        .word op_58, op_59, op_5a, op_5b, op_5c, op_5d, op_5e, op_5f
-        .word op_60, op_61, op_62, op_63, op_64, op_65, op_66, op_67
-        .word op_68, op_69, op_6a, op_6b, op_6c, op_6d, op_6e, op_6f
-        .word op_70, op_71, op_72, op_73, op_74, op_75, op_76, op_77
-        .word op_78, op_79, op_7a, op_7b, op_7c, op_7d, op_7e, op_7f
-        .word op_80, op_81, op_82, op_83, op_84, op_85, op_86, op_87
-        .word op_88, op_89, op_8a, op_8b, op_8c, op_8d, op_8e, op_8f
-        .word op_90, op_91, op_92, op_93, op_94, op_95, op_96, op_97
-        .word op_98, op_99, op_9a, op_9b, op_9c, op_9d, op_9e, op_9f
-        .word op_a0, op_a1, op_a2, op_a3, op_a4, op_a5, op_a6, op_a7
-        .word op_a8, op_a9, op_aa, op_ab, op_ac, op_ad, op_ae, op_af
-        .word op_b0, op_b1, op_b2, op_b3, op_b4, op_b5, op_b6, op_b7
-        .word op_b8, op_b9, op_ba, op_bb, op_bc, op_bd, op_be, op_bf
-        .word op_c0, op_c1, op_c2, op_c3, op_c4, op_c5, op_c6, op_c7
-        .word op_c8, op_c9, op_ca, op_cb, op_cc, op_cd, op_ce, op_cf
-        .word op_d0, op_d1, op_d2, op_d3, op_d4, op_d5, op_d6, op_d7
-        .word op_d8, op_d9, op_da, op_db, op_dc, op_dd, op_de, op_df
-        .word op_e0, op_e1, op_e2, op_e3, op_e4, op_e5, op_e6, op_e7
-        .word op_e8, op_e9, op_ea, op_eb, op_ec, op_ed, op_ee, op_ef
-        .word op_f0, op_f1, op_f2, op_f3, op_f4, op_f5, op_f6, op_f7
-        .word op_f8, op_f9, op_fa, op_fb, op_fc, op_fd, op_fe, op_ff
+
+op_vec_lo:
+        .byte <op_00, <op_01, <op_02, <op_03, <op_04, <op_05, <op_06, <op_07
+        .byte <op_08, <op_09, <op_0a, <op_0b, <op_0c, <op_0d, <op_0e, <op_0f
+        .byte <op_10, <op_11, <op_12, <op_13, <op_14, <op_15, <op_16, <op_17
+        .byte <op_18, <op_19, <op_1a, <op_1b, <op_1c, <op_1d, <op_1e, <op_1f
+        .byte <op_20, <op_21, <op_22, <op_23, <op_24, <op_25, <op_26, <op_27
+        .byte <op_28, <op_29, <op_2a, <op_2b, <op_2c, <op_2d, <op_2e, <op_2f
+        .byte <op_30, <op_31, <op_32, <op_33, <op_34, <op_35, <op_36, <op_37
+        .byte <op_38, <op_39, <op_3a, <op_3b, <op_3c, <op_3d, <op_3e, <op_3f
+        .byte <op_40, <op_41, <op_42, <op_43, <op_44, <op_45, <op_46, <op_47
+        .byte <op_48, <op_49, <op_4a, <op_4b, <op_4c, <op_4d, <op_4e, <op_4f
+        .byte <op_50, <op_51, <op_52, <op_53, <op_54, <op_55, <op_56, <op_57
+        .byte <op_58, <op_59, <op_5a, <op_5b, <op_5c, <op_5d, <op_5e, <op_5f
+        .byte <op_60, <op_61, <op_62, <op_63, <op_64, <op_65, <op_66, <op_67
+        .byte <op_68, <op_69, <op_6a, <op_6b, <op_6c, <op_6d, <op_6e, <op_6f
+        .byte <op_70, <op_71, <op_72, <op_73, <op_74, <op_75, <op_76, <op_77
+        .byte <op_78, <op_79, <op_7a, <op_7b, <op_7c, <op_7d, <op_7e, <op_7f
+        .byte <op_80, <op_81, <op_82, <op_83, <op_84, <op_85, <op_86, <op_87
+        .byte <op_88, <op_89, <op_8a, <op_8b, <op_8c, <op_8d, <op_8e, <op_8f
+        .byte <op_90, <op_91, <op_92, <op_93, <op_94, <op_95, <op_96, <op_97
+        .byte <op_98, <op_99, <op_9a, <op_9b, <op_9c, <op_9d, <op_9e, <op_9f
+        .byte <op_a0, <op_a1, <op_a2, <op_a3, <op_a4, <op_a5, <op_a6, <op_a7
+        .byte <op_a8, <op_a9, <op_aa, <op_ab, <op_ac, <op_ad, <op_ae, <op_af
+        .byte <op_b0, <op_b1, <op_b2, <op_b3, <op_b4, <op_b5, <op_b6, <op_b7
+        .byte <op_b8, <op_b9, <op_ba, <op_bb, <op_bc, <op_bd, <op_be, <op_bf
+        .byte <op_c0, <op_c1, <op_c2, <op_c3, <op_c4, <op_c5, <op_c6, <op_c7
+        .byte <op_c8, <op_c9, <op_ca, <op_cb, <op_cc, <op_cd, <op_ce, <op_cf
+        .byte <op_d0, <op_d1, <op_d2, <op_d3, <op_d4, <op_d5, <op_d6, <op_d7
+        .byte <op_d8, <op_d9, <op_da, <op_db, <op_dc, <op_dd, <op_de, <op_df
+        .byte <op_e0, <op_e1, <op_e2, <op_e3, <op_e4, <op_e5, <op_e6, <op_e7
+        .byte <op_e8, <op_e9, <op_ea, <op_eb, <op_ec, <op_ed, <op_ee, <op_ef
+        .byte <op_f0, <op_f1, <op_f2, <op_f3, <op_f4, <op_f5, <op_f6, <op_f7
+        .byte <op_f8, <op_f9, <op_fa, <op_fb, <op_fc, <op_fd, <op_fe, <op_ff
+
+op_vec_hi:
+        .byte >op_00, >op_01, >op_02, >op_03, >op_04, >op_05, >op_06, >op_07
+        .byte >op_08, >op_09, >op_0a, >op_0b, >op_0c, >op_0d, >op_0e, >op_0f
+        .byte >op_10, >op_11, >op_12, >op_13, >op_14, >op_15, >op_16, >op_17
+        .byte >op_18, >op_19, >op_1a, >op_1b, >op_1c, >op_1d, >op_1e, >op_1f
+        .byte >op_20, >op_21, >op_22, >op_23, >op_24, >op_25, >op_26, >op_27
+        .byte >op_28, >op_29, >op_2a, >op_2b, >op_2c, >op_2d, >op_2e, >op_2f
+        .byte >op_30, >op_31, >op_32, >op_33, >op_34, >op_35, >op_36, >op_37
+        .byte >op_38, >op_39, >op_3a, >op_3b, >op_3c, >op_3d, >op_3e, >op_3f
+        .byte >op_40, >op_41, >op_42, >op_43, >op_44, >op_45, >op_46, >op_47
+        .byte >op_48, >op_49, >op_4a, >op_4b, >op_4c, >op_4d, >op_4e, >op_4f
+        .byte >op_50, >op_51, >op_52, >op_53, >op_54, >op_55, >op_56, >op_57
+        .byte >op_58, >op_59, >op_5a, >op_5b, >op_5c, >op_5d, >op_5e, >op_5f
+        .byte >op_60, >op_61, >op_62, >op_63, >op_64, >op_65, >op_66, >op_67
+        .byte >op_68, >op_69, >op_6a, >op_6b, >op_6c, >op_6d, >op_6e, >op_6f
+        .byte >op_70, >op_71, >op_72, >op_73, >op_74, >op_75, >op_76, >op_77
+        .byte >op_78, >op_79, >op_7a, >op_7b, >op_7c, >op_7d, >op_7e, >op_7f
+        .byte >op_80, >op_81, >op_82, >op_83, >op_84, >op_85, >op_86, >op_87
+        .byte >op_88, >op_89, >op_8a, >op_8b, >op_8c, >op_8d, >op_8e, >op_8f
+        .byte >op_90, >op_91, >op_92, >op_93, >op_94, >op_95, >op_96, >op_97
+        .byte >op_98, >op_99, >op_9a, >op_9b, >op_9c, >op_9d, >op_9e, >op_9f
+        .byte >op_a0, >op_a1, >op_a2, >op_a3, >op_a4, >op_a5, >op_a6, >op_a7
+        .byte >op_a8, >op_a9, >op_aa, >op_ab, >op_ac, >op_ad, >op_ae, >op_af
+        .byte >op_b0, >op_b1, >op_b2, >op_b3, >op_b4, >op_b5, >op_b6, >op_b7
+        .byte >op_b8, >op_b9, >op_ba, >op_bb, >op_bc, >op_bd, >op_be, >op_bf
+        .byte >op_c0, >op_c1, >op_c2, >op_c3, >op_c4, >op_c5, >op_c6, >op_c7
+        .byte >op_c8, >op_c9, >op_ca, >op_cb, >op_cc, >op_cd, >op_ce, >op_cf
+        .byte >op_d0, >op_d1, >op_d2, >op_d3, >op_d4, >op_d5, >op_d6, >op_d7
+        .byte >op_d8, >op_d9, >op_da, >op_db, >op_dc, >op_dd, >op_de, >op_df
+        .byte >op_e0, >op_e1, >op_e2, >op_e3, >op_e4, >op_e5, >op_e6, >op_e7
+        .byte >op_e8, >op_e9, >op_ea, >op_eb, >op_ec, >op_ed, >op_ee, >op_ef
+        .byte >op_f0, >op_f1, >op_f2, >op_f3, >op_f4, >op_f5, >op_f6, >op_f7
+        .byte >op_f8, >op_f9, >op_fa, >op_fb, >op_fc, >op_fd, >op_fe, >op_ff
