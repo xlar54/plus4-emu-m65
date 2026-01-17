@@ -97,22 +97,19 @@ fetch16_to_addr:
 
 ; --- push_data ---
 push_data:
-        ldy p4_sp
-        sty p4_addr_lo
-        lda #$01
-        sta p4_addr_hi
-        jsr P4MEM_Write
+        ; Optimized push - direct access to LOW_RAM_BUFFER stack area
+        ldx p4_sp
+        lda p4_data
+        sta $8100,x             ; Stack is at $8100-$81FF
         dec p4_sp
         rts
 
 ; --- pull_to_a ---
 pull_to_a:
+        ; Optimized pull - direct access to LOW_RAM_BUFFER stack area
         inc p4_sp
-        ldy p4_sp
-        sty p4_addr_lo
-        lda #$01
-        sta p4_addr_hi
-        jsr P4MEM_Read
+        ldx p4_sp
+        lda $8100,x             ; Stack is at $8100-$81FF
         rts
 
 ; --- Addressing modes ---
@@ -2093,28 +2090,31 @@ op_81:
 
 ; $84 STY zp
 op_84:
-        jsr addr_zp
+        ; Optimized STY zp
+        jsr fetch8
+        tax
         lda p4_y
-        sta p4_data
-        jsr P4MEM_Write
+        sta $8000,x
         lda #3
         jmp finish_cycles
 
 ; $85 STA zp
 op_85:
-        jsr addr_zp
+        ; Optimized STA zp - direct access to LOW_RAM_BUFFER
+        jsr fetch8              ; Get zero page address in A
+        tax
         lda p4_a
-        sta p4_data
-        jsr P4MEM_Write
+        sta $8000,x             ; Direct write to LOW_RAM_BUFFER
         lda #3
         jmp finish_cycles
 
 ; $86 STX zp
 op_86:
-        jsr addr_zp
+        ; Optimized STX zp
+        jsr fetch8
+        tax
         lda p4_x
-        sta p4_data
-        jsr P4MEM_Write
+        sta $8000,x
         lda #3
         jmp finish_cycles
 
@@ -2276,8 +2276,10 @@ op_a2:
 
 ; $A4 LDY zp
 op_a4:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized LDY zp
+        jsr fetch8
+        tax
+        lda $8000,x
         sta p4_y
         jsr set_zn_a
         lda #3
@@ -2285,8 +2287,10 @@ op_a4:
 
 ; $A5 LDA zp
 op_a5:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized LDA zp - direct access to LOW_RAM_BUFFER
+        jsr fetch8              ; Get zero page address in A
+        tax
+        lda $8000,x             ; Direct read from LOW_RAM_BUFFER
         sta p4_a
         jsr set_zn_a
         lda #3
@@ -2294,8 +2298,10 @@ op_a5:
 
 ; $A6 LDX zp
 op_a6:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized LDX zp
+        jsr fetch8
+        tax
+        lda $8000,x
         sta p4_x
         jsr set_zn_a
         lda #3
@@ -2492,13 +2498,11 @@ op_c5:
 
 ; $C6 DEC zp
 op_c6:
-        jsr addr_zp
-        jsr P4MEM_Read
-        sec
-        sbc #1
-        sta p4_data
-        jsr P4MEM_Write
-        lda p4_data
+        ; Optimized DEC zp
+        jsr fetch8
+        tax
+        dec $8000,x
+        lda $8000,x
         jsr set_zn_a
         lda #5
         jmp finish_cycles
@@ -2673,13 +2677,11 @@ op_e5:
 
 ; $E6 INC zp
 op_e6:
-        jsr addr_zp
-        jsr P4MEM_Read
-        clc
-        adc #1
-        sta p4_data
-        jsr P4MEM_Write
-        lda p4_data
+        ; Optimized INC zp
+        jsr fetch8
+        tax
+        inc $8000,x
+        lda $8000,x
         jsr set_zn_a
         lda #5
         jmp finish_cycles
