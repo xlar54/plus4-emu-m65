@@ -734,101 +734,67 @@ do_sbc:
         ; If D flag clear -> original binary path
         lda p4_p
         and #P_D
-        beq _do_sbc_bin
+        bne _do_sbc_decimal      ; D set, do decimal
+        jmp _do_sbc_bin          ; D clear, do binary
 
+_do_sbc_decimal:
         ; ---------- decimal SBC ----------
-        ; Save original A
+        ; Save original A for nibble comparisons
         lda p4_a
         sta p4_dec_a
 
-        ; carry_in (C=1 means no borrow) -> p4_vec_lo (0/1)
+        ; Do binary subtraction first (for V flag)
         lda p4_p
         and #P_C
-        beq _sbc_dec_c0
-        lda #1
-        bne _sbc_dec_cstore
-_sbc_dec_c0:
-        lda #0
-_sbc_dec_cstore:
-        sta p4_vec_lo
-
-        ; Binary subtract first (for V computation)
-        lda p4_vec_lo
         beq _sbc_dec_clc
         sec
         bne _sbc_dec_go
 _sbc_dec_clc:
         clc
 _sbc_dec_go:
-        lda p4_dec_a
+        lda p4_a
         sbc p4_tmp
         sta p4_a
-        php                     ; save binary flags (esp V)
+        php                     ; save flags for V
 
-        ; Save binary carry-out (no borrow) into p4_vec_hi (0/1)
-        bcc _sbc_dec_borrow
-        lda #1
-        bne _sbc_dec_cout_store
-_sbc_dec_borrow:
+        ; Save carry (1 = no borrow, 0 = borrow)
         lda #0
-_sbc_dec_cout_store:
-        sta p4_vec_hi
+        rol                     ; A = carry (0 or 1)
+        sta p4_vec_hi           ; save for later
 
-        ; Low nibble adjust:
-        ; if (A_lo - M_lo - (1-Cin)) < 0 then subtract 6
-        lda p4_tmp
+        ; Check if low nibble needs adjustment
+        ; If (A_lo & $0F) > (orig_A_lo & $0F), we had a borrow from high nibble
+        lda p4_a
         and #$0F
-        sta p4_tmp2             ; m_lo
-
-        ; borrow_in = 1 - Cin
-        lda #1
-        sec
-        sbc p4_vec_lo           ; -> 1 if Cin=0 else 0
-        tay                     ; Y = borrow_in (0/1)
-
+        sta p4_tmp2             ; result low nibble
         lda p4_dec_a
-        and #$0F
-        sec
-        sbc p4_tmp2
-        tya
-        beq _sbc_dec_no_bi
-        sec
-        sbc #$00                ; ensure carry set for next SBC
-_sbc_dec_no_bi:
-        ; We need to subtract borrow_in:
-        ; easiest: redo cleanly:
-        lda p4_dec_a
-        and #$0F
-        sec
-        sbc p4_tmp2
-        tya
-        beq _sbc_dec_chk_lo
-        sec
-        sbc #$01
-_sbc_dec_chk_lo:
-        bpl _sbc_dec_no6
+        and #$0F                ; original low nibble
+        cmp p4_tmp2
+        bcs _sbc_no_lo_adj      ; orig >= result, no low borrow
+        ; Low nibble borrowed, subtract 6
         lda p4_a
         sec
         sbc #$06
         sta p4_a
-_sbc_dec_no6:
+_sbc_no_lo_adj:
 
-        ; High adjust if binary borrow occurred (carry_out=0): subtract $60
+        ; Check if high nibble needs adjustment
+        ; If we had an overall borrow (carry was 0), subtract $60
         lda p4_vec_hi
-        bne _sbc_dec_no60
+        bne _sbc_no_hi_adj      ; carry was 1, no borrow
         lda p4_a
         sec
         sbc #$60
         sta p4_a
-_sbc_dec_no60:
+_sbc_no_hi_adj:
 
-        ; Restore binary flags for V via PLP, then rebuild p4_p C/V
+        ; Restore flags and set C/V in p4_p
         plp
         lda p4_p
         and #(~(P_C|P_V)) & $ff
         sta p4_p
 
-        ; C from binary carry-out (p4_vec_hi): 1=no borrow, 0=borrow
+        ; Set C from saved carry
         lda p4_vec_hi
         beq _sbc_dec_noc
         lda p4_p
@@ -836,7 +802,7 @@ _sbc_dec_no60:
         sta p4_p
 _sbc_dec_noc:
 
-        ; V from binary subtract (host V flag after PLP)
+        ; Set V from binary subtract
         bvc _sbc_dec_nov
         lda p4_p
         ora #P_V
