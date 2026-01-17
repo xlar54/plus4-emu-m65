@@ -1,5 +1,5 @@
 ; ============================================================
-; p4mem_m65.asm - Memory system for Plus/4 emulator
+; p4mem_m65.asm - Memory system for Plus/4 emulator (OPTIMIZED)
 ; Host: MEGA65
 ; Assembler: 64tass (with 45GS02 support)
 ; ============================================================
@@ -10,6 +10,12 @@
 ;     $4C000-$4FFFF: KERNAL ROM (mapped to Plus/4 $C000-$FFFF)
 ;   Bank 5 ($50000-$5FFFF): Plus/4 RAM (64KB)
 ;
+; Optimization Strategy:
+;   - Zero page ($00xx) and Stack ($01xx) are kept in local RAM
+;     and synced at init/exit - these are accessed constantly
+;   - 4KB page buffer for other memory accesses
+;   - Separate ROM buffer (read-only, no flush needed)
+;
 ; ============================================================
 
         .cpu "45gs02"
@@ -18,22 +24,32 @@
 BANK_ROM    = $04          ; Plus/4 ROMs in bank 4
 BANK_RAM    = $05          ; Plus/4 RAM in bank 5
 
-; We use a 256-byte page buffer at $4000 in bank 0 (safe RAM area)
-PAGE_BUFFER = $4000
+; Memory buffers in bank 0 (host RAM)
+; Using addresses above emulator code (which ends around $6000-$7000)
+; $8000 was used for ROM staging but is free after init
+LOW_RAM_BUFFER = $8000     ; 4KB - Plus/4 low RAM $0000-$0FFF (always resident)
+RAM_BUFFER  = $9000        ; 4KB - general RAM buffer for $1000+
+ROM_BUFFER  = $A000        ; 4KB - ROM buffer (BASIC or KERNAL)
+
+RAM_BUF_SIZE = $1000       ; 4KB = 16 pages
+ROM_BUF_SIZE = $1000       ; 4KB = 16 pages
 
 ; State variables
 p4_rom_visible:      .byte 1    ; 1 = ROM visible, 0 = RAM only
 p4_rom_bank:         .byte 0    ; Which function ROM bank (0-3)
-current_page_num:    .byte $FF  ; Which page is in buffer ($FF = none)
-current_page_is_rom: .byte 0    ; 0 = RAM page, 1 = ROM page
-page_dirty:          .byte 0    ; 1 = buffer modified, needs writeback
+
+; RAM buffer state: covers 16 consecutive pages
+ram_buf_base:        .byte $FF  ; Base page number in RAM buffer ($FF = none)
+ram_buf_dirty:       .byte 0    ; Buffer dirty flag
+
+; ROM buffer state: covers 16 consecutive pages  
+rom_buf_base:        .byte $FF  ; Base page number in ROM buffer ($FF = none)
+rom_buf_is_basic:    .byte 0    ; 0 = KERNAL, 1 = BASIC
 
 ; TED registers are defined in plus4_cpu_m65.asm
-; ted_regs, ted_timer1_lo/hi, ted_raster_lo/hi
 
 ; ============================================================
-; P4MEM_Init
-; Initialize memory system
+; P4MEM_Init - Initialize memory system
 ; ============================================================
 P4MEM_Init:
         ; Initialize state
@@ -41,13 +57,12 @@ P4MEM_Init:
         sta p4_rom_visible
         lda #0
         sta p4_rom_bank
+        sta ram_buf_dirty
         
-        ; No page loaded yet
+        ; No buffers loaded yet
         lda #$FF
-        sta current_page_num
-        lda #0
-        sta current_page_is_rom
-        sta page_dirty
+        sta ram_buf_base
+        sta rom_buf_base
         
         ; Clear TED registers
         ldx #31
@@ -57,38 +72,56 @@ _clear_ted:
         dex
         bpl _clear_ted
         
+        ; Initialize timer to $FFFF (will reload from ted_regs when it underflows)
+        lda #$FF
         sta ted_timer1_lo
         sta ted_timer1_hi
+        lda #0
         sta ted_raster_lo
         sta ted_raster_hi
         
         ; Clear Plus/4 RAM (Bank 5) to zero
         jsr P4MEM_ClearRAM
+        
+        ; Clear local low RAM buffer to zero
+        jsr clear_low_ram_buffer
 
         rts
 
 ; ============================================================
-; P4MEM_ClearRAM
-; Clear all of Plus/4 RAM (Bank 5) to zero
+; P4MEM_ClearRAM - Clear all Plus/4 RAM (Bank 5)
 ; ============================================================
 P4MEM_ClearRAM:
-        ; use DMA to clear bank 5 (inline, no modification needed)
         lda #$00
         sta $D707
-        .byte $80                       ; enhanced dma - src bits 20-27
-        .byte $00                       ; src MB
-        .byte $81                       ; enhanced dma - dest bits 20-27
-        .byte $00                       ; dest MB
-        .byte $00                       ; end of job options
-        .byte $03                       ; 3 = fill                                 
+        .byte $80, $00, $81, $00, $00   ; enhanced DMA options
+        .byte $03                       ; fill
         .word $0000                     ; count (0 = 64K)
         .word $0000                     ; fill with $00
-        .byte $00                       ; unused with fill
-        .word $0000                     ; destination start
+        .byte $00                       ; unused
+        .word $0000                     ; dest start
         .byte BANK_RAM                  ; dest bank 5
-        .byte $00                       ; command high byte
-        .word $0000                     ; modulo (ignored)
-        
+        .byte $00
+        .word $0000
+        rts
+
+; ============================================================
+; clear_low_ram_buffer - Clear the 4KB low RAM buffer to zero
+; ============================================================
+clear_low_ram_buffer:
+        ; Use DMA to clear 4KB at LOW_RAM_BUFFER
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03                       ; fill
+        .word $1000                     ; 4KB
+        .word $0000                     ; fill with $00
+        .byte $00                       ; unused
+        .byte <LOW_RAM_BUFFER
+        .byte >LOW_RAM_BUFFER
+        .byte $00                       ; dest bank 0
+        .byte $00
+        .word $0000
         rts
 
 ; ============================================================
@@ -98,23 +131,38 @@ P4MEM_ClearRAM:
 ; ============================================================
 P4MEM_Read:
         lda p4_addr_hi
+        
+        ; Check for low RAM $0000-$0FFF (always in local buffer)
+        cmp #$10
+        bcs _read_not_low_ram
+        
+        ; Read from LOW_RAM_BUFFER + (page * 256) + offset
+        clc
+        adc #>LOW_RAM_BUFFER     ; Add buffer base high byte
+        sta _read_low+2
+        ldx p4_addr_lo
+_read_low:
+        lda LOW_RAM_BUFFER,x     ; High byte modified
+        rts
+        
+_read_not_low_ram:
         cmp #$80
         bcs _read_high_memory
         
-        ; --- Low RAM $0000-$7FFF: Always from RAM bank ---
+        ; Low RAM $0200-$7FFF (excluding screen)
         jmp read_from_ram
 
 _read_high_memory:
-        ; Check for I/O area first ($FF00-$FF3F)
+        ; Check for I/O area ($FF00-$FF3F)
         cmp #$FF
         bne _read_not_io
         lda p4_addr_lo
         cmp #$40
-        bcs _read_kernal_high     ; $FF40-$FFFF is KERNAL ROM
+        bcs _read_kernal_high
         cmp #$20
-        bcs _read_not_ted_io      ; $FF20-$FF3F: other I/O
+        bcs _read_not_ted_io
         
-        ; --- TED registers $FF00-$FF1F ---
+        ; TED registers $FF00-$FF1F
         cmp #$08
         beq _read_keyboard
         cmp #$1C
@@ -122,13 +170,11 @@ _read_high_memory:
         cmp #$1D
         beq _read_raster_hi
         
-        ; Default: read from TED shadow
         tax
         lda ted_regs,x
         rts
 
 _read_keyboard:
-        ; Read C64 keyboard matrix
         lda $DC01
         rts
 
@@ -143,21 +189,18 @@ _read_raster_hi:
         rts
 
 _read_not_ted_io:
-        ; $FF20-$FF3F: Minimal I/O handling - fall through to KERNAL
-        
 _read_kernal_high:
-        ; $FF40-$FFFF: Always KERNAL ROM
+        ; $FF40-$FFFF or $FF20-$FF3F: KERNAL ROM
         jmp read_from_kernal
 
 _read_not_io:
-        ; Check for $FDxx (ACIA, etc)
         lda p4_addr_hi
         cmp #$FD
         bne _read_not_fd
         
         lda p4_addr_lo
         cmp #$30
-        beq _read_fd30           ; Keyboard row select
+        beq _read_fd30
         cmp #$10
         bcc _read_acia
         jmp _read_not_fd
@@ -172,85 +215,132 @@ _read_acia:
         lda #$00
         rts
 _read_acia_status:
-        lda #$10                 ; Transmit buffer empty
+        lda #$10
         rts
 
 _read_not_fd:
-        ; Check for $FC00-$FCFF (always KERNAL)
-        lda p4_addr_hi
-        cmp #$FC
-        beq read_from_kernal
-        
-        ; Check ROM visibility for $8000-$FBFF
+        ; Check ROM visibility for $8000-$FCFF
         lda p4_rom_visible
-        beq read_from_ram        ; ROM not visible, read RAM
+        beq read_from_ram
         
-        ; ROM visible - determine which ROM
+        ; ROM is visible - determine which ROM
         lda p4_addr_hi
         cmp #$C0
-        bcs read_from_kernal     ; $C000-$FBFF = KERNAL
-        ; $8000-$BFFF = BASIC
-        jmp read_from_basic
+        bcs read_from_kernal    ; $C000-$FCFF -> KERNAL
+        jmp read_from_basic     ; $8000-$BFFF -> BASIC
 
 ; ============================================================
-; read_from_ram - Read byte from Plus/4 RAM (Bank 5)
+; read_from_ram - Read from Plus/4 RAM via buffer
 ; ============================================================
 read_from_ram:
-        ; Check if we have the right page loaded
+        ; Check if RAM buffer is loaded
+        lda ram_buf_base
+        cmp #$FF
+        beq _rfram_load          ; Buffer not loaded
+        
+        ; Check if page is in buffer
         lda p4_addr_hi
-        cmp current_page_num
-        bne _rfr_load
-        lda current_page_is_rom
-        beq _rfr_read            ; Already have correct RAM page
+        sec
+        sbc ram_buf_base
+        bcc _rfram_load          ; Below buffer range
+        cmp #$10
+        bcs _rfram_load          ; Above buffer range (16 pages)
         
-_rfr_load:
-        jsr flush_if_dirty
-        jsr load_ram_page
-        
-_rfr_read:
+        ; Page is in buffer - calculate address
+        ; high byte = >RAM_BUFFER + page_offset
+        clc
+        adc #>RAM_BUFFER         ; add to buffer base high byte
+        sta _rfram_rd+2          ; self-modify
         ldx p4_addr_lo
-        lda PAGE_BUFFER,x
+_rfram_rd:
+        lda RAM_BUFFER,x         ; high byte gets modified
         rts
+        
+_rfram_load:
+        jsr load_ram_buffer
+        jmp read_from_ram        ; retry
 
 ; ============================================================
-; read_from_kernal - Read byte from KERNAL ROM (Bank 4, $C000+)
+; read_from_kernal - Read from KERNAL ROM via buffer
 ; ============================================================
 read_from_kernal:
-        ; Check if we have the right page loaded
+        ; Check if ROM buffer is loaded
+        lda rom_buf_base
+        cmp #$FF
+        beq _rfk_load            ; Buffer not loaded
+        
+        ; Check if it's KERNAL (not BASIC)
+        lda rom_buf_is_basic
+        bne _rfk_load            ; Wrong ROM type loaded
+        
+        ; Check if page is in buffer range
         lda p4_addr_hi
-        cmp current_page_num
-        bne _rfk_load
-        lda current_page_is_rom
-        bne _rfk_read            ; Already have correct ROM page
+        sec
+        sbc rom_buf_base
+        bcc _rfk_load
+        cmp #$10
+        bcs _rfk_load
+        
+        ; Page is in buffer
+        clc
+        adc #>ROM_BUFFER
+        sta _rfk_rd+2
+        ldx p4_addr_lo
+_rfk_rd:
+        lda ROM_BUFFER,x
+        rts
         
 _rfk_load:
-        jsr flush_if_dirty
-        jsr load_rom_page
+        ; Load KERNAL pages into ROM buffer
+        lda p4_addr_hi
+        and #$F0                 ; Align to 16-page boundary
+        sta rom_buf_base
+        lda #0
+        sta rom_buf_is_basic
         
-_rfk_read:
-        ldx p4_addr_lo
-        lda PAGE_BUFFER,x
-        rts
+        jsr load_rom_buffer
+        jmp read_from_kernal
 
 ; ============================================================
-; read_from_basic - Read byte from BASIC ROM (Bank 4, $8000+)
+; read_from_basic - Read from BASIC ROM via buffer
 ; ============================================================
 read_from_basic:
-        ; Check if we have the right page loaded
+        ; Check if ROM buffer is loaded
+        lda rom_buf_base
+        cmp #$FF
+        beq _rfb_load            ; Buffer not loaded
+        
+        ; Check if it's BASIC (not KERNAL)
+        lda rom_buf_is_basic
+        beq _rfb_load            ; Wrong ROM type loaded
+        
+        ; Check if page is in buffer range
         lda p4_addr_hi
-        cmp current_page_num
-        bne _rfb_load
-        lda current_page_is_rom
-        bne _rfb_read            ; Already have correct ROM page
+        sec
+        sbc rom_buf_base
+        bcc _rfb_load
+        cmp #$10
+        bcs _rfb_load
+        
+        ; Page is in buffer
+        clc
+        adc #>ROM_BUFFER
+        sta _rfb_rd+2
+        ldx p4_addr_lo
+_rfb_rd:
+        lda ROM_BUFFER,x
+        rts
         
 _rfb_load:
-        jsr flush_if_dirty
-        jsr load_rom_page
+        ; Load BASIC pages into ROM buffer
+        lda p4_addr_hi
+        and #$F0                 ; Align to 16-page boundary
+        sta rom_buf_base
+        lda #1
+        sta rom_buf_is_basic
         
-_rfb_read:
-        ldx p4_addr_lo
-        lda PAGE_BUFFER,x
-        rts
+        jsr load_rom_buffer
+        jmp read_from_basic
 
 ; ============================================================
 ; P4MEM_Write
@@ -259,16 +349,63 @@ _rfb_read:
 ; ============================================================
 P4MEM_Write:
         lda p4_addr_hi
+        
+        ; Check for low RAM $0000-$0FFF (always in local buffer)
+        cmp #$10
+        bcs _write_not_low_ram
+        
+        ; Write to LOW_RAM_BUFFER + (page * 256) + offset
+        pha                      ; Save page for mirror checks
+        clc
+        adc #>LOW_RAM_BUFFER
+        sta _write_low+2
+        ldx p4_addr_lo
+        lda p4_data
+_write_low:
+        sta LOW_RAM_BUFFER,x     ; High byte modified
+        
+        ; Check for mirroring
+        pla                      ; Get page back
+        cmp #$0C
+        bcs _do_screen_mirror    ; $0C-$0F: screen mirror
+        cmp #$08
+        bcs _do_color_mirror     ; $08-$0B: color mirror
+        rts                      ; $00-$07: no mirror needed
+
+_do_screen_mirror:
+        ; Screen mirror: Plus/4 $0C00-$0FFF -> MEGA65 $0800-$0BFF
+        sec
+        sbc #$04                 ; $0C->$08, $0D->$09, etc.
+        sta _scr_mir+2
+        ldx p4_addr_lo
+        lda p4_data
+_scr_mir:
+        sta $0800,x
+        rts
+
+_do_color_mirror:
+        ; Color RAM mirror: Plus/4 $0800-$0BFF -> MEGA65 $D800-$DBFF
+        clc
+        adc #$D0                 ; $08->$D8, $09->$D9, etc.
+        sta _col_mir+2
+        ldx p4_addr_lo
+        lda p4_data
+        and #$7F
+        tay
+        lda ted_to_c64_color,y
+_col_mir:
+        sta $D800,x
+        rts
+        
+_write_not_low_ram:
         cmp #$FF
         beq _write_ff_page
         jmp _write_check_fd
 
 _write_ff_page:
-        ; Check for ROM bank switching
         lda p4_addr_lo
         cmp #$3F
         bne _write_not_ff3f
-        ; $FF3F: Make RAM visible (ROM disabled)
         lda #0
         sta p4_rom_visible
         rts
@@ -276,34 +413,29 @@ _write_ff_page:
 _write_not_ff3f:
         cmp #$3E
         bne _write_not_ff3e
-        ; $FF3E: Make ROM visible
         lda #1
         sta p4_rom_visible
         rts
 
 _write_not_ff3e:
-        ; Check for TED registers $FF00-$FF1F
         cmp #$20
         bcs _write_not_ted
         
-        ; TED register write
         tax
         lda p4_data
         sta ted_regs,x
         
-        ; Handle special registers
         cpx #$01
-        beq _write_ff01          ; Timer reload
+        beq _write_ff01
         cpx #$09
-        beq _write_ff09          ; IRQ acknowledge
+        beq _write_ff09
         cpx #$15
-        beq _write_ff15          ; Background color
+        beq _write_ff15
         cpx #$19
-        beq _write_ff19          ; Border color
+        beq _write_ff19
         rts
 
 _write_ff01:
-        ; Writing Timer 1 high byte reloads timer
         lda ted_regs+$00
         sta ted_timer1_lo
         lda ted_regs+$01
@@ -311,7 +443,6 @@ _write_ff01:
         rts
 
 _write_ff09:
-        ; Acknowledge interrupts (write 1 to clear)
         lda p4_data
         eor #$FF
         and ted_regs+$09
@@ -319,25 +450,24 @@ _write_ff09:
         rts
 
 _write_ff15:
-        ; Background color -> C64 $D021
+        ; Background color - use low 4 bits for base color
         lda p4_data
-        and #$0F
+        and #$7F                 ; Get full TED color (0-127)
         tax
-        lda p4_to_c64_color,x
+        lda ted_to_c64_color,x   ; Map to C64 color
         sta $D021
         rts
 
 _write_ff19:
-        ; Border color -> C64 $D020
+        ; Border color - use low 4 bits for base color
         lda p4_data
-        and #$0F
+        and #$7F                 ; Get full TED color (0-127)
         tax
-        lda p4_to_c64_color,x
+        lda ted_to_c64_color,x   ; Map to C64 color
         sta $D020
         rts
 
 _write_not_ted:
-        ; Other $FFxx - write to RAM underneath
         jmp write_to_ram
 
 _write_check_fd:
@@ -348,7 +478,6 @@ _write_check_fd:
         lda p4_addr_lo
         cmp #$30
         bne _write_chk_fdd0
-        ; $FD30: Keyboard column select
         lda p4_data
         sta $DC00
         rts
@@ -356,196 +485,183 @@ _write_check_fd:
 _write_chk_fdd0:
         cmp #$D0
         bcc write_to_ram
-        ; $FDD0-$FDDF: ROM bank select
         and #$0F
         sta p4_rom_bank
         rts
 
 ; ============================================================
-; write_to_ram - Write byte to Plus/4 RAM (Bank 5)
+; write_to_ram - Write to Plus/4 RAM via buffer (for pages $10+)
 ; ============================================================
 write_to_ram:
-        ; Check if we have the right page loaded
-        lda p4_addr_hi
-        cmp current_page_num
-        bne _wtr_load
-        lda current_page_is_rom
-        beq _wtr_write           ; Already have correct RAM page
+        ; Check if RAM buffer is loaded
+        lda ram_buf_base
+        cmp #$FF
+        beq _wtram_load          ; Buffer not loaded
         
-_wtr_load:
-        jsr flush_if_dirty
-        jsr load_ram_page
-        
-_wtr_write:
-        ; Write to page buffer
-        ldx p4_addr_lo
-        lda p4_data
-        sta PAGE_BUFFER,x
-        
-        ; Mark dirty
-        lda #1
-        sta page_dirty
-        
-        ; --- Screen mirroring ---
-        ; Plus/4 screen $0C00-$0FFF -> MEGA65 $0800-$0BFF
-        lda p4_addr_hi
-        cmp #$0C
-        bcc _write_check_color
-        cmp #$10
-        bcs _write_done
-        
-        ; Map $0Cxx-$0Fxx to $08xx-$0Bxx
+        ; Check if page is in buffer
         lda p4_addr_hi
         sec
-        sbc #$04                 ; $0C->$08, $0D->$09, etc
-        sta _scr_st+2            ; Self-modify high byte
-        lda p4_data
-_scr_st sta $0800,x              ; X still has p4_addr_lo
-        rts
-
-_write_check_color:
-        ; Plus/4 color $0800-$0BFF -> C64 color $D800-$DBFF
-        cmp #$08
-        bcc _write_done
-        cmp #$0C
-        bcs _write_done
+        sbc ram_buf_base
+        bcc _wtram_load
+        cmp #$10
+        bcs _wtram_load
         
-        ; Map $08xx-$0Bxx to $D8xx-$DBxx
-        lda p4_addr_hi
+        ; Page is in buffer - calculate address
         clc
-        adc #$D0                 ; $08->$D8, $09->$D9, etc
-        sta _col_st+2            ; Self-modify high byte
+        adc #>RAM_BUFFER
+        sta _wtram_wr+2          ; self-modify
+        ldx p4_addr_lo
         lda p4_data
-        and #$0F
-        tay
-        lda p4_to_c64_color,y
-_col_st sta $D800,x              ; X still has p4_addr_lo
-
-_write_done:
-        rts
-
-; ============================================================
-; Page management routines
-; ============================================================
-
-; flush_if_dirty - Write page buffer back to RAM if modified
-flush_if_dirty:
-        lda page_dirty
-        beq fid_done
-        lda current_page_is_rom
-        bne fid_clear            ; Don't write back ROM pages
+_wtram_wr:
+        sta RAM_BUFFER,x
         
-        ; Set destination high byte in the DMA data
-        lda current_page_num
-        sta dma_flush_data+12    ; dst hi is at offset 12
-        
-        ; Execute the DMA by jumping to the trigger code
-        jsr do_dma_flush
-        
-fid_clear:
-        lda #0
-        sta page_dirty
-        
-fid_done:
-        rts
-
-; load_ram_page - Load page from Plus/4 RAM (Bank 5) into buffer
-load_ram_page:
-        lda p4_addr_hi
-        sta current_page_num
-        sta dma_ram_data+9       ; src hi is at offset 9
-        lda #0
-        sta current_page_is_rom
-        sta page_dirty
-        
-        ; Execute the DMA
-        jsr do_dma_ram
-        rts
-
-; load_rom_page - Load page from Plus/4 ROM (Bank 4) into buffer
-load_rom_page:
-        lda p4_addr_hi
-        sta current_page_num
-        sta dma_rom_data+9       ; src hi is at offset 9
+        ; Mark buffer as dirty
         lda #1
-        sta current_page_is_rom
-        lda #0
-        sta page_dirty
+        sta ram_buf_dirty
+        rts
         
-        ; Execute the DMA
-        jsr do_dma_rom
+_wtram_load:
+        jsr flush_ram_buffer
+        jsr load_ram_buffer
+        jmp write_to_ram
+
+; ============================================================
+; Color RAM mirroring - called from low RAM write for $0800-$0BFF
+; ============================================================
+_write_color_mirror:
+        ; Plus/4 color RAM $0800-$0BFF -> MEGA65 $D800-$DBFF
+        lda p4_addr_hi
+        cmp #$08
+        bcc _write_color_done
+        cmp #$0C
+        bcs _write_color_done
+        
+        clc
+        adc #$D0
+        sta _col_st+2
+        ldx p4_addr_lo
+        lda p4_data
+        and #$7F                 ; Get full TED color
+        tay
+        lda ted_to_c64_color,y   ; Map to C64 color
+_col_st sta $D800,x
+
+_write_color_done:
         rts
 
 ; ============================================================
-; DMA trigger routines - each has inline data following sta $D707
+; Buffer management routines
 ; ============================================================
 
-do_dma_flush:
+; flush_ram_buffer - Write dirty pages back to Plus/4 RAM
+flush_ram_buffer:
+        lda ram_buf_dirty
+        beq _flush_done          ; Nothing dirty
+        
+        lda ram_buf_base
+        cmp #$FF
+        beq _flush_done          ; No buffer loaded
+        
+        ; DMA copy entire 4KB buffer back to bank 5
+        lda ram_buf_base
+        sta _flush_dst+1
+        
         lda #$00
         sta $D707
-dma_flush_data:
-        .byte $80                ; +0: enhanced dma - src bits 20-27
-        .byte $00                ; +1: src MB
-        .byte $81                ; +2: enhanced dma - dest bits 20-27
-        .byte $00                ; +3: dest MB
-        .byte $00                ; +4: end of job options
-        .byte $00                ; +5: command = copy
-        .word $0100              ; +6,+7: count = 256 bytes
-        .byte <PAGE_BUFFER       ; +8: src lo
-        .byte >PAGE_BUFFER       ; +9: src hi
-        .byte $00                ; +10: src bank 0
-        .byte $00                ; +11: dst lo
-        .byte $00                ; +12: dst hi (MODIFIED)
-        .byte BANK_RAM           ; +13: dst bank 5
-        .byte $00                ; +14: command high byte
-        .word $0000              ; +15,+16: modulo
+        .byte $80, $00, $81, $00, $00
+        .byte $00                       ; copy
+        .word RAM_BUF_SIZE              ; 4KB
+        .byte <RAM_BUFFER, >RAM_BUFFER, $00
+_flush_dst:
+        .byte $00, $00, BANK_RAM        ; dst hi byte modified
+        .byte $00
+        .word $0000
+        
+        lda #0
+        sta ram_buf_dirty
+        
+_flush_done:
         rts
 
-do_dma_ram:
+; load_ram_buffer - Load 4KB from Plus/4 RAM into buffer
+; Aligns to 16-page boundary based on p4_addr_hi
+load_ram_buffer:
+        jsr flush_ram_buffer
+        
+        ; Align to 16-page boundary
+        lda p4_addr_hi
+        and #$F0
+        sta ram_buf_base
+        sta _load_ram_src+1
+        
         lda #$00
         sta $D707
-dma_ram_data:
-        .byte $80                ; +0: enhanced dma - src bits 20-27
-        .byte $00                ; +1: src MB
-        .byte $81                ; +2: enhanced dma - dest bits 20-27
-        .byte $00                ; +3: dest MB
-        .byte $00                ; +4: end of job options
-        .byte $00                ; +5: command = copy
-        .word $0100              ; +6,+7: count = 256 bytes
-        .byte $00                ; +8: src lo
-        .byte $00                ; +9: src hi (MODIFIED)
-        .byte BANK_RAM           ; +10: src bank 5
-        .byte <PAGE_BUFFER       ; +11: dst lo
-        .byte >PAGE_BUFFER       ; +12: dst hi
-        .byte $00                ; +13: dst bank 0
-        .byte $00                ; +14: command high byte
-        .word $0000              ; +15,+16: modulo
+        .byte $80, $00, $81, $00, $00
+        .byte $00                       ; copy
+        .word RAM_BUF_SIZE              ; 4KB
+_load_ram_src:
+        .byte $00, $00, BANK_RAM        ; src hi byte modified
+        .byte <RAM_BUFFER, >RAM_BUFFER, $00
+        .byte $00
+        .word $0000
         rts
 
-do_dma_rom:
+; load_rom_buffer - Load 4KB from Plus/4 ROM into buffer
+; Uses rom_buf_base and rom_buf_is_basic
+load_rom_buffer:
+        lda rom_buf_base
+        sta _load_rom_src+1
+        
         lda #$00
         sta $D707
-dma_rom_data:
-        .byte $80                ; +0: enhanced dma - src bits 20-27
-        .byte $00                ; +1: src MB
-        .byte $81                ; +2: enhanced dma - dest bits 20-27
-        .byte $00                ; +3: dest MB
-        .byte $00                ; +4: end of job options
-        .byte $00                ; +5: command = copy
-        .word $0100              ; +6,+7: count = 256 bytes
-        .byte $00                ; +8: src lo
-        .byte $00                ; +9: src hi (MODIFIED)
-        .byte BANK_ROM           ; +10: src bank 4
-        .byte <PAGE_BUFFER       ; +11: dst lo
-        .byte >PAGE_BUFFER       ; +12: dst hi
-        .byte $00                ; +13: dst bank 0
-        .byte $00                ; +14: command high byte
-        .word $0000              ; +15,+16: modulo
+        .byte $80, $00, $81, $00, $00
+        .byte $00                       ; copy
+        .word ROM_BUF_SIZE              ; 4KB
+_load_rom_src:
+        .byte $00, $00, BANK_ROM        ; src hi byte modified, bank 4
+        .byte <ROM_BUFFER, >ROM_BUFFER, $00
+        .byte $00
+        .word $0000
         rts
 
 ; ============================================================
-; Plus/4 to C64 color mapping
+; TED to C64 color mapping table (128 entries)
+; TED color format: 0LLL CCCC (L=luminance 0-7, C=color 0-15)
+; Maps each TED color to closest C64 color (0-15)
+;
+; Plus/4 colors:  0=black, 1=white, 2=red, 3=cyan, 4=purple, 5=green
+;                 6=blue, 7=yellow, 8=orange, 9=brown, 10=yellow-green
+;                 11=pink, 12=blue-green, 13=light blue, 14=dark blue, 15=light green
 ; ============================================================
-p4_to_c64_color:
-        .byte $00, $0F, $08, $07, $0A, $0C, $00, $0D
-        .byte $06, $09, $02, $04, $0E, $05, $03, $01
+ted_to_c64_color:
+        ; Luminance 0 (darkest) - all map to black or dark colors
+        .byte $00, $0F, $02, $03, $04, $05, $06, $07  ; colors 0-7
+        .byte $08, $09, $05, $0A, $0B, $0E, $06, $0D  ; colors 8-15
+        
+        ; Luminance 1
+        .byte $00, $0F, $02, $03, $04, $05, $06, $07
+        .byte $08, $09, $05, $0A, $0B, $0E, $06, $0D
+        
+        ; Luminance 2
+        .byte $00, $0C, $02, $03, $04, $05, $06, $07
+        .byte $08, $09, $05, $0A, $0B, $0E, $06, $0D
+        
+        ; Luminance 3 - medium luminance (default Plus/4 colors)
+        .byte $00, $0F, $02, $03, $04, $05, $06, $07
+        .byte $08, $09, $0D, $0A, $03, $0E, $06, $0D
+        
+        ; Luminance 4
+        .byte $0B, $0F, $0A, $03, $04, $0D, $0E, $07
+        .byte $08, $09, $0D, $0A, $03, $0E, $0E, $0D
+        
+        ; Luminance 5
+        .byte $0B, $0F, $0A, $03, $0A, $0D, $0E, $07
+        .byte $08, $09, $0D, $07, $03, $0E, $0E, $0D
+        
+        ; Luminance 6
+        .byte $0C, $0F, $0A, $03, $0A, $0D, $0E, $07
+        .byte $07, $07, $07, $07, $03, $07, $0E, $0D
+        
+        ; Luminance 7 (brightest) - all map to white or light colors
+        .byte $0F, $0F, $0A, $03, $0A, $0D, $0E, $07
+        .byte $07, $07, $07, $07, $03, $07, $07, $0F
