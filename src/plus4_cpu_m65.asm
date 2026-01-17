@@ -349,8 +349,22 @@ _ted_check_wrap:
         bcc _ted_check_irq
         ; Wrap to line 0
         lda #0
+
+        ; after:
         sta ted_raster_lo
         sta ted_raster_hi
+
+        inc p4_cur_div
+        lda p4_cur_div
+        cmp #8 ; cursor blink rate
+        bcc _no_cur_toggle
+        lda #0
+        sta p4_cur_div
+        lda p4_cur_phase
+        eor #1
+        sta p4_cur_phase
+        jsr P4VID_UpdateCursor
+_no_cur_toggle:
         
 _ted_check_irq:
         ; Check if raster matches compare register for IRQ

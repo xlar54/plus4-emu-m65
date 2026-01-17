@@ -48,6 +48,12 @@ rom_buf_is_basic:    .byte 0    ; 0 = KERNAL, 1 = BASIC
 
 ; TED registers are defined in plus4_cpu_m65.asm
 
+; --- Cursor overlay state (host-side rendering aid) ---
+p4_cur_prev_lo:   .byte $FF   ; $FF = none
+p4_cur_prev_hi:   .byte $FF
+p4_cur_phase:     .byte 0     ; 0/1 toggle for blink
+p4_cur_div:       .byte 0     ; frame divider
+
 ; ============================================================
 ; P4MEM_Init - Initialize memory system
 ; ============================================================
@@ -424,6 +430,16 @@ _write_not_ff3e:
         tax
         lda p4_data
         sta ted_regs,x
+
+; FOR BLINKING CURSOR OVERLAY
+        cpx #$0C
+        beq _ted_cursor_changed
+        cpx #$0D
+        bne _ted_write_done
+_ted_cursor_changed:
+        jsr P4VID_UpdateCursor
+_ted_write_done:
+; END BLINKING CURSOR OVERLAY
         
         cpx #$01
         beq _write_ff01
@@ -488,6 +504,73 @@ _write_chk_fdd0:
         and #$0F
         sta p4_rom_bank
         rts
+
+; FOR BLINKING CURSOR OVERLAY
+; P4VID_UpdateCursor
+; Uses:
+;  - Plus/4 screen RAM is in LOW_RAM_BUFFER+$0C00 => $8C00
+;  - Host screen is $0800-$0BFF (your mirror target)
+
+P4VID_UpdateCursor:
+    ; --- restore previous cursor cell ---
+    lda p4_cur_prev_hi
+    cmp #$FF
+    beq _no_restore
+
+    ; set screen source page: $8C + (prev_hi & 3)
+    lda p4_cur_prev_hi
+    and #$03
+    clc
+    adc #$8C
+    sta _scr_restore+2
+
+    ; set host dest page: $08 + (prev_hi & 3)
+    lda p4_cur_prev_hi
+    and #$03
+    clc
+    adc #$08
+    sta _host_restore+2
+
+    ldx p4_cur_prev_lo
+_scr_restore:
+    lda $8C00,x
+    and #$7F
+_host_restore:
+    sta $0800,x
+
+_no_restore:
+    ; --- load new cursor pos from TED regs ---
+    lda ted_regs+$0C
+    and #$03
+    sta p4_cur_prev_hi
+    lda ted_regs+$0D
+    sta p4_cur_prev_lo
+
+    ; set pages for new pos
+    lda p4_cur_prev_hi
+    and #$03
+    clc
+    adc #$8C
+    sta _scr_set+2
+
+    lda p4_cur_prev_hi
+    and #$03
+    clc
+    adc #$08
+    sta _host_set+2
+
+    ldx p4_cur_prev_lo
+_scr_set:
+    lda $8C00,x
+    and #$7F
+    ldy p4_cur_phase
+    beq _write_cursor
+    ora #$80          ; reverse-video on host to show cursor
+_write_cursor:
+_host_set:
+    sta $0800,x
+; END BLINKING CURSOR OVERLAY
+    rts
 
 ; ============================================================
 ; write_to_ram - Write to Plus/4 RAM via buffer (for pages $10+)
