@@ -41,9 +41,7 @@ start:
         sta $D02F
         lda #$53
         sta $D02F              ; Unlock MEGA65 registers
-        
-        ;lda #$40
-        ;sta $D031              ; Enable 40 MHz mode
+
 
         ; Print banner
         ldx #0
@@ -112,21 +110,6 @@ _k_msg: lda kernal_ok_msg,x
         bne _k_msg
 _k_done:
 
-        ; TEST: Verify KERNAL file loaded to $8000 correctly
-        ; First 2 bytes should be $E0 $02
-        lda #'l'
-        jsr CHROUT
-        lda #'d'
-        jsr CHROUT
-        lda #'='
-        jsr CHROUT
-        lda $8000
-        jsr print_hex8
-        lda $8001
-        jsr print_hex8
-        lda #' '
-        jsr CHROUT
-
         ; use DMA to copy the bytes
         ; 8000 -> C000 (kernel) in bank 4
         lda #$00
@@ -143,18 +126,6 @@ _k_done:
         .byte $00                       ; command high byte
         .word $0000                     ; modulo (ignored)
 
-        ; TEST: Verify KERNAL copy worked - read first 2 bytes from bank 4 $C000
-        ; The KERNAL starts with $E0 $02
-        lda #'k'
-        jsr CHROUT
-        lda #'='
-        jsr CHROUT
-        
-        ; First, put marker bytes at $4000 to verify DMA writes
-        lda #$AA
-        sta $4000
-        lda #$55
-        sta $4001
         
         ; DMA copy 2 bytes from bank 4 $C000 to $4000 bank 0
         lda #$00
@@ -166,13 +137,6 @@ _k_done:
         .byte $00, $40, $00             ; dst: $4000, bank 0
         .byte $00
         .word $0000
-        
-        lda $4000
-        jsr print_hex8
-        lda $4001
-        jsr print_hex8
-        lda #' '
-        jsr CHROUT
 
         ; ----------------------------------------------------
         ; 2) Load BASIC ROM to $8000
@@ -220,18 +184,6 @@ _b_done:
         .byte $00                       ; command high byte
         .word $0000                     ; modulo (ignored)
 
-        ; ----------------------------------------------------
-        ; TEST: Direct DMA read from bank 4, page $FF to $C000
-        ; This bypasses P4MEM to verify the ROM data is there
-        ; ----------------------------------------------------
-        lda #'t'
-        jsr CHROUT
-        lda #'s'
-        jsr CHROUT
-        lda #'t'
-        jsr CHROUT
-        lda #'='
-        jsr CHROUT
         
         ; DMA copy 256 bytes from bank 4 $FF00 to bank 0 $4000
         lda #$00
@@ -247,14 +199,6 @@ _b_done:
         .byte $00, $40, $00      ; dst: $4000, bank 0
         .byte $00                ; cmd hi
         .word $0000              ; modulo
-        
-        ; Now read $40FC and $40FD (should be reset vector)
-        lda $40FD                ; High byte
-        jsr print_hex8
-        lda $40FC                ; Low byte  
-        jsr print_hex8
-        lda #$0D
-        jsr CHROUT
 
         ; ----------------------------------------------------
         ; 3) Initialize memory system (clears Plus/4 RAM in bank 5)
@@ -277,38 +221,6 @@ _ready_msg:
         inx
         bne _ready_msg
 _ready_done:
-
-        ; ----------------------------------------------------
-        ; Test: Read reset vector from KERNAL
-        ; ----------------------------------------------------
-        lda #$FF
-        sta p4_addr_hi
-        lda #$FC
-        sta p4_addr_lo
-        jsr P4MEM_Read
-        sta p4_tmp              ; Low byte
-        lda #$FD
-        sta p4_addr_lo
-        jsr P4MEM_Read
-        sta p4_tmp2             ; High byte
-        
-        ; Print reset vector
-        lda #'r'
-        jsr CHROUT
-        lda #'s'
-        jsr CHROUT
-        lda #'t'
-        jsr CHROUT
-        lda #'='
-        jsr CHROUT
-        lda p4_tmp2
-        jsr print_hex8
-        lda p4_tmp
-        jsr print_hex8
-        lda #$0D
-        jsr CHROUT
-
-;rts
 
         ; Wait for keypress
         ldx #0
