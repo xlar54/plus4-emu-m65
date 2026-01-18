@@ -26,33 +26,47 @@ BANK_RAM    = $05                       ; Plus/4 RAM in bank 5
 
 ; Memory buffers in bank 0 (host RAM)
 ; Using addresses above emulator code (which ends around $4000)
-; $8000 was used for ROM staging but is free after init
+;
+; VIC Bank 1 layout (for bitmap mode):
+;   $4000-$47FF: Available
+;   $4800-$4BFF: screen matrix (1KB)
+;   $4C00-$5FFF: LOW_RAM_BUFFER extends into this
+;   $6000-$7FFF: bitmap (8KB)
+;
+; OPTIMIZED STRATEGY:
+;   - Plus/4 RAM in bank 5 ($50000-$5FFFF) accessed directly via 32-bit pointers
+;   - No RAM buffer needed for $1000+ - direct 32-bit addressing to bank 5
+;   - LOW_RAM_BUFFER only for $0000-$0FFF (zero page, stack, screen, color)
+;   - KERNAL shadow for fast ROM reads
+;
 LOW_RAM_BUFFER  = $5000                 ; 4KB - Plus/4 low RAM $0000-$1000 (always resident)
 
 ; Common low-RAM offsets (computed from LOW_RAM_BUFFER)
 P4_SCREEN_BASE  = LOW_RAM_BUFFER + $0C00
 P4_TCOLOR       = LOW_RAM_BUFFER + $07ED
 
-RAM_BUFFER      = $8000                 ; 4KB - general RAM buffer for $1000+  ($8000-$9FFF)
-RAM_BUF_SIZE    = $2000                 ; $1000 = 4KB, $2000 = 8KB
+; KERNAL shadow: Plus/4 $E000-$FFFF (upper 8KB) copied to bank 0 for fast access
+; This covers reset vectors, IRQ handlers, and most KERNAL routines
+KERNAL_SHADOW   = $8000                 ; 8KB shadow of Plus/4 $E000-$FFFF
+KERNAL_SHADOW_SIZE = $2000              ; 8KB
 
-ROM_BUFFER      = $A000                 ; 4KB - ROM buffer (BASIC or KERNAL)   ($A000-$BFFF)
-ROM_BUF_SIZE    = $2000                 ; $1000 = 4KB, $2000 = 8KB
+ROM_BUFFER      = $A000                 ; 8KB - ROM buffer (BASIC + lower KERNAL)
+ROM_BUF_SIZE    = $2000                 ; 8KB
+
+; 32-bit pointer for direct access to Plus/4 RAM in bank 5
+; Located in zero page for use with 32-bit indirect addressing
+; Format: [lo, hi, bank, 0] where bank 5 = $05
+P4_RAM_PTR      = $F0                   ; 4 bytes at $F0-$F3
 
 ; --- Buffer geometry (derived) ---
-; Keep RAM/ROM buffer sizing consistent everywhere by using these.
-RAM_BUF_PAGES   = RAM_BUF_SIZE / $0100    ; pages in RAM buffer
 ROM_BUF_PAGES   = ROM_BUF_SIZE / $0100    ; pages in ROM buffer
-RAM_BUF_MASK    = $0100 - RAM_BUF_PAGES   ; align mask for base page
 ROM_BUF_MASK    = $0100 - ROM_BUF_PAGES   ; align mask for base page
 
 ; State variables
 p4_rom_visible:      .byte 1    ; 1 = ROM visible, 0 = RAM only
 p4_rom_bank:         .byte 0    ; Which function ROM bank (0-3)
 
-; RAM buffer state: covers 16 consecutive pages
-ram_buf_base:        .byte $FF  ; Base page number in RAM buffer ($FF = none)
-ram_buf_dirty:       .byte 0    ; Buffer dirty flag
+; ROM buffer state
 
 ; ROM buffer state: covers 16 consecutive pages  
 rom_buf_base:        .byte $FF  ; Base page number in ROM buffer ($FF = none)
@@ -85,17 +99,29 @@ p4_save_d021:     .byte 0
 ; P4MEM_Init - Initialize memory system
 ; ============================================================
 P4MEM_Init:
+        ; NOTE: Don't change C64 banking here - we still need MEGA65 KERNAL
+        ; for CHROUT etc. Banking will be set up in main.asm before emulation.
+        
         ; Initialize state
         lda #1
         sta p4_rom_visible
         lda #0
         sta p4_rom_bank
-        sta ram_buf_dirty
         
-        ; No buffers loaded yet
+        ; No ROM buffer loaded yet
         lda #$FF
-        sta ram_buf_base
         sta rom_buf_base
+        
+        ; Initialize 32-bit pointer for Plus/4 RAM access (bank 5)
+        ; P4_RAM_PTR will be: [lo, hi, $05, $00]
+        ; We'll update lo/hi before each access
+        lda #$00
+        sta P4_RAM_PTR          ; lo byte (will be set per access)
+        sta P4_RAM_PTR+1        ; hi byte (will be set per access)  
+        lda #BANK_RAM           ; $05 for bank 5
+        sta P4_RAM_PTR+2
+        lda #$00
+        sta P4_RAM_PTR+3        ; mega-byte (0)
         
         ; Clear TED registers
         ldx #31
@@ -106,10 +132,13 @@ _clear_ted:
         bpl _clear_ted
         
         ; Initialize TED color registers to Plus/4 defaults
-        lda #$F1                ; Default background (white, lum 7)
+        lda #$71                ; Default background (white, lum 7, color 1)
         sta ted_regs+$15
-        lda #$EE                ; Default border (light blue)
+        lda #$6E                ; Default border (light blue, lum 6, color 14)
         sta ted_regs+$19
+        
+        ; Don't set $D020/$D021 here - let startup screen use default C64 colors
+        ; The Plus/4 KERNAL will set the colors when emulation starts
         
         ; Initialize timer to $FFFF (will reload from ted_regs when it underflows)
         lda #$FF
@@ -125,6 +154,26 @@ _clear_ted:
         ; Clear local low RAM buffer to zero
         jsr clear_low_ram_buffer
 
+        ; Load upper 8KB of KERNAL ($E000-$FFFF) into shadow for fast access
+        jsr load_kernal_shadow
+
+        rts
+
+; ============================================================
+; load_kernal_shadow - Copy upper 8KB KERNAL to shadow buffer
+; Source: Bank 4 $E000-$FFFF (Plus/4 KERNAL upper half)
+; Dest:   KERNAL_SHADOW ($8000-$9FFF in bank 0)
+; ============================================================
+load_kernal_shadow:
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00   ; enhanced DMA options
+        .byte $00                       ; copy
+        .word KERNAL_SHADOW_SIZE        ; 8KB
+        .byte $00, $E0, BANK_ROM        ; src: $E000, bank 4
+        .byte <KERNAL_SHADOW, >KERNAL_SHADOW, $00   ; dst: KERNAL_SHADOW, bank 0
+        .byte $00
+        .word $0000
         rts
 
 ; ============================================================
@@ -287,41 +336,40 @@ _read_not_fd:
         jmp read_from_basic     ; $8000-$BFFF -> BASIC
 
 ; ============================================================
-; read_from_ram - Read from Plus/4 RAM via buffer
+; read_from_ram - Read from Plus/4 RAM using 32-bit flat addressing
+; Direct access to bank 5 without DMA buffering
+; Uses LDA [$nn],Z instruction for 32-bit indirect addressing
 ; ============================================================
 read_from_ram:
-        ; Check if RAM buffer is loaded
-        lda ram_buf_base
-        cmp #$FF
-        beq _rfram_load          ; Buffer not loaded
-        
-        ; Check if page is in buffer
+        ; Set up 32-bit pointer to Plus/4 RAM address
+        ; P4_RAM_PTR = [p4_addr_lo, p4_addr_hi, $05, $00]
+        lda p4_addr_lo
+        sta P4_RAM_PTR
         lda p4_addr_hi
-        sec
-        sbc ram_buf_base
-        bcc _rfram_load          ; Below buffer range
-        cmp #RAM_BUF_PAGES
-        bcs _rfram_load          ; Above buffer range
+        sta P4_RAM_PTR+1
+        ; P4_RAM_PTR+2 already has $05 (bank 5)
+        ; P4_RAM_PTR+3 already has $00
         
-        ; Page is in buffer - calculate address
-        ; high byte = >RAM_BUFFER + page_offset
-        clc
-        adc #>RAM_BUFFER         ; add to buffer base high byte
-        sta _rfram_rd+2          ; self-modify
-        ldx p4_addr_lo
-_rfram_rd:
-        lda RAM_BUFFER,x         ; high byte gets modified
+        ; Use 32-bit indirect addressing: LDA [P4_RAM_PTR],Z
+        ; Z register is index (use 0 for no offset)
+        ldz #$00
+        nop                     ; 32-bit addressing prefix (NOP = $EA)
+        lda (P4_RAM_PTR),z      ; 32-bit indirect load
         rts
-        
-_rfram_load:
-        jsr load_ram_buffer
-        jmp read_from_ram        ; retry
 
 ; ============================================================
-; read_from_kernal - Read from KERNAL ROM via buffer
+; read_from_kernal - Read from KERNAL ROM
+; Upper 8KB ($E000-$FFFF) uses fast shadow in bank 0
+; Lower 8KB ($C000-$DFFF) uses ROM buffer with DMA
 ; ============================================================
 read_from_kernal:
-        ; Check if ROM buffer is loaded
+        ; Check if address is in shadow range ($E000-$FFFF)
+        lda p4_addr_hi
+        cmp #$E0
+        bcs _rfk_shadow          ; >= $E0, use shadow
+        
+        ; Lower KERNAL ($C000-$DFFF) - use ROM buffer
+        ; Check if ROM buffer is loaded with correct KERNAL pages
         lda rom_buf_base
         cmp #$FF
         beq _rfk_load            ; Buffer not loaded
@@ -357,6 +405,18 @@ _rfk_load:
         
         jsr load_rom_buffer
         jmp read_from_kernal
+
+; Fast path: read from KERNAL shadow (upper 8KB: $E000-$FFFF)
+; Shadow is at KERNAL_SHADOW ($8000), maps $E000->$8000, $FF->$9F
+_rfk_shadow:
+        ; Map $E0-$FF to $80-$9F (subtract $60)
+        sec
+        sbc #$60
+        sta _rfk_shrd+2
+        ldx p4_addr_lo
+_rfk_shrd:
+        lda KERNAL_SHADOW,x      ; High byte modified above
+        rts
 
 ; ============================================================
 ; read_from_basic - Read from BASIC ROM via buffer
@@ -644,34 +704,25 @@ _host_set:
     rts
 
 ; ============================================================
-; write_to_ram - Write to Plus/4 RAM via buffer (for pages $10+)
+; write_to_ram - Write to Plus/4 RAM using 32-bit flat addressing
+; Direct access to bank 5 without DMA buffering
+; Uses STA [$nn],Z instruction for 32-bit indirect addressing
 ; ============================================================
 write_to_ram:
-        ; Check if RAM buffer is loaded
-        lda ram_buf_base
-        cmp #$FF
-        beq _wtram_load          ; Buffer not loaded
-        
-        ; Check if page is in buffer
+        ; Set up 32-bit pointer to Plus/4 RAM address
+        ; P4_RAM_PTR = [p4_addr_lo, p4_addr_hi, $05, $00]
+        lda p4_addr_lo
+        sta P4_RAM_PTR
         lda p4_addr_hi
-        sec
-        sbc ram_buf_base
-        bcc _wtram_load
-        cmp #RAM_BUF_PAGES
-        bcs _wtram_load
+        sta P4_RAM_PTR+1
+        ; P4_RAM_PTR+2 already has $05 (bank 5)
+        ; P4_RAM_PTR+3 already has $00
         
-        ; Page is in buffer - calculate address
-        clc
-        adc #>RAM_BUFFER
-        sta _wtram_wr+2          ; self-modify
-        ldx p4_addr_lo
+        ; Use 32-bit indirect addressing: STA [P4_RAM_PTR],Z
+        ldz #$00
         lda p4_data
-_wtram_wr:
-        sta RAM_BUFFER,x
-        
-        ; Mark buffer as dirty
-        lda #1
-        sta ram_buf_dirty
+        nop                     ; 32-bit addressing prefix
+        sta (P4_RAM_PTR),z      ; 32-bit indirect store
 
         ; If this write hits the active bitmap region, mark frame dirty
         lda p4_video_mode
@@ -685,11 +736,6 @@ _wtram_wr:
         sta p4_gfx_dirty
 _wtram_done:
         rts
-        
-_wtram_load:
-        jsr flush_ram_buffer
-        jsr load_ram_buffer
-        jmp write_to_ram
 
 ; ============================================================
 ; Color RAM mirroring - called from low RAM write for $0800-$0BFF
@@ -719,60 +765,7 @@ _write_color_done:
 ; Buffer management routines
 ; ============================================================
 
-; flush_ram_buffer - Write dirty pages back to Plus/4 RAM
-flush_ram_buffer:
-        lda ram_buf_dirty
-        beq _flush_done          ; Nothing dirty
-        
-        lda ram_buf_base
-        cmp #$FF
-        beq _flush_done          ; No buffer loaded
-        
-        ; DMA copy entire 4KB buffer back to bank 5
-        lda ram_buf_base
-        sta _flush_dst+1
-        
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $00                       ; copy
-        .word RAM_BUF_SIZE              ; 4KB
-        .byte <RAM_BUFFER, >RAM_BUFFER, $00
-_flush_dst:
-        .byte $00, $00, BANK_RAM        ; dst hi byte modified
-        .byte $00
-        .word $0000
-        
-        lda #0
-        sta ram_buf_dirty
-        
-_flush_done:
-        rts
-
-; load_ram_buffer - Load 4KB from Plus/4 RAM into buffer
-; Aligns to 16-page boundary based on p4_addr_hi
-load_ram_buffer:
-        jsr flush_ram_buffer
-        
-        ; Align to 16-page boundary
-        lda p4_addr_hi
-        and #RAM_BUF_MASK
-        sta ram_buf_base
-        sta _load_ram_src+1
-        
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $00                       ; copy
-        .word RAM_BUF_SIZE              ; 4KB
-_load_ram_src:
-        .byte $00, $00, BANK_RAM        ; src hi byte modified
-        .byte <RAM_BUFFER, >RAM_BUFFER, $00
-        .byte $00
-        .word $0000
-        rts
-
-; load_rom_buffer - Load 4KB from Plus/4 ROM into buffer
+; load_rom_buffer - Load ROM pages from Plus/4 ROM into buffer
 ; Uses rom_buf_base and rom_buf_is_basic
 load_rom_buffer:
         lda rom_buf_base
@@ -847,10 +840,8 @@ P4VID_Frame:
         lda #0
         sta p4_gfx_dirty
 
-        ; Ensure cached RAM writes are visible in bank 5 before DMA read
-        lda ram_buf_dirty
-        beq _pf_copy
-        jsr flush_ram_buffer
+        ; With direct 32-bit RAM access, writes go straight to bank 5
+        ; No buffer flush needed
 
 _pf_copy:
         jsr P4VID_RenderHiresBitmap
@@ -995,22 +986,25 @@ _bm_src:
 ; Plus/4 colors:  0=black, 1=white, 2=red, 3=cyan, 4=purple, 5=green
 ;                 6=blue, 7=yellow, 8=orange, 9=brown, 10=yellow-green
 ;                 11=pink, 12=blue-green, 13=light blue, 14=dark blue, 15=light green
+; C64 colors: 0=black, 1=white, 2=red, 3=cyan, 4=purple, 5=green
+;             6=blue, 7=yellow, 8=orange, 9=brown, 10=light red, 11=dark grey
+;             12=grey, 13=light green, 14=light blue, 15=light grey
 ; ============================================================
 ted_to_c64_color:
         ; Luminance 0 (darkest) - all map to black or dark colors
-        .byte $00, $0F, $02, $03, $04, $05, $06, $07  ; colors 0-7
+        .byte $00, $0B, $02, $03, $04, $05, $06, $07  ; colors 0-7
         .byte $08, $09, $05, $0A, $0B, $0E, $06, $0D  ; colors 8-15
         
         ; Luminance 1
-        .byte $00, $0F, $02, $03, $04, $05, $06, $07
+        .byte $00, $0B, $02, $03, $04, $05, $06, $07
         .byte $08, $09, $05, $0A, $0B, $0E, $06, $0D
         
         ; Luminance 2
         .byte $00, $0C, $02, $03, $04, $05, $06, $07
         .byte $08, $09, $05, $0A, $0B, $0E, $06, $0D
         
-        ; Luminance 3 - medium luminance (default Plus/4 colors)
-        .byte $00, $0F, $02, $03, $04, $05, $06, $07
+        ; Luminance 3 - medium luminance
+        .byte $00, $0C, $02, $03, $04, $05, $06, $07
         .byte $08, $09, $0D, $0A, $03, $0E, $06, $0D
         
         ; Luminance 4
@@ -1025,6 +1019,6 @@ ted_to_c64_color:
         .byte $0C, $0F, $0A, $03, $0A, $0D, $0E, $07
         .byte $07, $07, $07, $07, $03, $07, $0E, $0D
         
-        ; Luminance 7 (brightest) - all map to white or light colors
-        .byte $0F, $0F, $0A, $03, $0A, $0D, $0E, $07
-        .byte $07, $07, $07, $07, $03, $07, $07, $0F
+        ; Luminance 7 (brightest) - TED white (1) maps to C64 white ($01)
+        .byte $01, $01, $0A, $03, $0A, $0D, $0E, $07
+        .byte $07, $07, $07, $07, $03, $07, $07, $01
