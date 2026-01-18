@@ -21,18 +21,30 @@
         .cpu "45gs02"
 
 ; Bank numbers
-BANK_ROM    = $04          ; Plus/4 ROMs in bank 4
-BANK_RAM    = $05          ; Plus/4 RAM in bank 5
+BANK_ROM    = $04                       ; Plus/4 ROMs in bank 4
+BANK_RAM    = $05                       ; Plus/4 RAM in bank 5
 
 ; Memory buffers in bank 0 (host RAM)
-; Using addresses above emulator code (which ends around $6000-$7000)
+; Using addresses above emulator code (which ends around $4000)
 ; $8000 was used for ROM staging but is free after init
-LOW_RAM_BUFFER = $8000     ; 4KB - Plus/4 low RAM $0000-$0FFF (always resident)
-RAM_BUFFER  = $9000        ; 4KB - general RAM buffer for $1000+
-ROM_BUFFER  = $A000        ; 4KB - ROM buffer (BASIC or KERNAL)
+LOW_RAM_BUFFER  = $5000                 ; 4KB - Plus/4 low RAM $0000-$1000 (always resident)
 
-RAM_BUF_SIZE = $1000       ; 4KB = 16 pages
-ROM_BUF_SIZE = $1000       ; 4KB = 16 pages
+; Common low-RAM offsets (computed from LOW_RAM_BUFFER)
+P4_SCREEN_BASE  = LOW_RAM_BUFFER + $0C00
+P4_TCOLOR       = LOW_RAM_BUFFER + $07ED
+
+RAM_BUFFER      = $8000                 ; 4KB - general RAM buffer for $1000+  ($8000-$9FFF)
+RAM_BUF_SIZE    = $2000                 ; $1000 = 4KB, $2000 = 8KB
+
+ROM_BUFFER      = $A000                 ; 4KB - ROM buffer (BASIC or KERNAL)   ($A000-$BFFF)
+ROM_BUF_SIZE    = $2000                 ; $1000 = 4KB, $2000 = 8KB
+
+; --- Buffer geometry (derived) ---
+; Keep RAM/ROM buffer sizing consistent everywhere by using these.
+RAM_BUF_PAGES   = RAM_BUF_SIZE / $0100    ; pages in RAM buffer
+ROM_BUF_PAGES   = ROM_BUF_SIZE / $0100    ; pages in ROM buffer
+RAM_BUF_MASK    = $0100 - RAM_BUF_PAGES   ; align mask for base page
+ROM_BUF_MASK    = $0100 - ROM_BUF_PAGES   ; align mask for base page
 
 ; State variables
 p4_rom_visible:      .byte 1    ; 1 = ROM visible, 0 = RAM only
@@ -288,8 +300,8 @@ read_from_ram:
         sec
         sbc ram_buf_base
         bcc _rfram_load          ; Below buffer range
-        cmp #$10
-        bcs _rfram_load          ; Above buffer range (16 pages)
+        cmp #RAM_BUF_PAGES
+        bcs _rfram_load          ; Above buffer range
         
         ; Page is in buffer - calculate address
         ; high byte = >RAM_BUFFER + page_offset
@@ -323,7 +335,7 @@ read_from_kernal:
         sec
         sbc rom_buf_base
         bcc _rfk_load
-        cmp #$10
+        cmp #ROM_BUF_PAGES
         bcs _rfk_load
         
         ; Page is in buffer
@@ -338,7 +350,7 @@ _rfk_rd:
 _rfk_load:
         ; Load KERNAL pages into ROM buffer
         lda p4_addr_hi
-        and #$F0                 ; Align to 16-page boundary
+        and #ROM_BUF_MASK        ; Align to ROM buffer boundary
         sta rom_buf_base
         lda #0
         sta rom_buf_is_basic
@@ -364,7 +376,7 @@ read_from_basic:
         sec
         sbc rom_buf_base
         bcc _rfb_load
-        cmp #$10
+        cmp #ROM_BUF_PAGES
         bcs _rfb_load
         
         ; Page is in buffer
@@ -379,7 +391,7 @@ _rfb_rd:
 _rfb_load:
         ; Load BASIC pages into ROM buffer
         lda p4_addr_hi
-        and #$F0                 ; Align to 16-page boundary
+        and #ROM_BUF_MASK        ; Align to ROM buffer boundary
         sta rom_buf_base
         lda #1
         sta rom_buf_is_basic
@@ -567,7 +579,7 @@ _write_chk_fdd0:
 ; FOR BLINKING CURSOR OVERLAY
 ; P4VID_UpdateCursor
 ; Uses:
-;  - Plus/4 screen RAM is in LOW_RAM_BUFFER+$0C00 => $8C00
+;  - Plus/4 screen RAM is in LOW_RAM_BUFFER+$0C00
 ;  - Host screen is $0800-$0BFF (your mirror target)
 
 P4VID_UpdateCursor:
@@ -580,7 +592,7 @@ P4VID_UpdateCursor:
     lda p4_cur_prev_hi
     and #$03
     clc
-    adc #$8C
+    adc #>P4_SCREEN_BASE
     sta _scr_restore+2
 
     ; set host dest page: $08 + (prev_hi & 3)
@@ -592,7 +604,7 @@ P4VID_UpdateCursor:
 
     ldx p4_cur_prev_lo
 _scr_restore:
-    lda $8C00,x
+    lda P4_SCREEN_BASE,x
     and #$7F
 _host_restore:
     sta $0800,x
@@ -609,7 +621,7 @@ _no_restore:
     lda p4_cur_prev_hi
     and #$03
     clc
-    adc #$8C
+    adc #>P4_SCREEN_BASE
     sta _scr_set+2
 
     lda p4_cur_prev_hi
@@ -620,7 +632,7 @@ _no_restore:
 
     ldx p4_cur_prev_lo
 _scr_set:
-    lda $8C00,x
+    lda P4_SCREEN_BASE,x
     and #$7F
     ldy p4_cur_phase
     beq _write_cursor
@@ -645,7 +657,7 @@ write_to_ram:
         sec
         sbc ram_buf_base
         bcc _wtram_load
-        cmp #$10
+        cmp #RAM_BUF_PAGES
         bcs _wtram_load
         
         ; Page is in buffer - calculate address
@@ -744,7 +756,7 @@ load_ram_buffer:
         
         ; Align to 16-page boundary
         lda p4_addr_hi
-        and #$F0
+        and #RAM_BUF_MASK
         sta ram_buf_base
         sta _load_ram_src+1
         
@@ -895,7 +907,7 @@ P4VID_EnableHostBitmap:
         
         ; Get foreground from Plus/4 TCOLOR ($07ED) 
         ; Read from LOW_RAM_BUFFER + $7ED = $87ED
-        lda $87ED
+        lda P4_TCOLOR
         and #$7F                ; Get TED color (0-127)
         tax
         lda ted_to_c64_color,x  ; Convert to C64 color

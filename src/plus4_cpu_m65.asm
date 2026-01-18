@@ -105,9 +105,12 @@ zn_table:
 
 ; --- inc_pc ---
 inc_pc:
-        inc p4_pc_lo
-        bne _incpc_done
-        inc p4_pc_hi
+        inw p4_pc_lo
+        rts
+
+        ;inc p4_pc_lo
+        ;bne _incpc_done
+        ;inc p4_pc_hi
 _incpc_done:
         rts
 
@@ -136,7 +139,7 @@ push_data:
         ; Optimized push - direct access to LOW_RAM_BUFFER stack area
         ldx p4_sp
         lda p4_data
-        sta $8100,x             ; Stack is at $8100-$81FF
+        sta LOW_RAM_BUFFER+$0100,x             ; Stack is at LOW_RAM_BUFFER+100 - LOW_RAM_BUFFER+1FF
         dec p4_sp
         rts
 
@@ -145,7 +148,7 @@ pull_to_a:
         ; Optimized pull - direct access to LOW_RAM_BUFFER stack area
         inc p4_sp
         ldx p4_sp
-        lda $8100,x             ; Stack is at $8100-$81FF
+        lda LOW_RAM_BUFFER+$0100,x             ; Stack is at LOW_RAM_BUFFER+100 - LOW_RAM_BUFFER+1FF
         rts
 
 ; --- Addressing modes ---
@@ -1125,9 +1128,10 @@ _op0e_nc:
 ; $10 BPL
 op_10:
         jsr fetch_rel
-        lda p4_p
-        and #P_N
-        bne _op10_nt
+        bbs 7, p4_p,_op10_nt
+        ;lda p4_p
+        ;and #P_N
+        ;bne _op10_nt
         jsr branch_do
         lda p4_xtra
         clc
@@ -1442,9 +1446,10 @@ _op2e_nc:
 ; $30 BMI
 op_30:
         jsr fetch_rel
-        lda p4_p
-        and #P_N
-        beq _op30_nt
+        bbr 7, p4_p, _op30_nt
+        ;lda p4_p
+        ;and #P_N
+        ;beq _op30_nt
         jsr branch_do
         lda p4_xtra
         clc
@@ -1702,9 +1707,10 @@ _op4e_nc:
 ; $50 BVC
 op_50:
         jsr fetch_rel
-        lda p4_p
-        and #P_V
-        bne _op50_nt
+        bbs 6, p4_p, _op50_nt
+        ;lda p4_p
+        ;and #P_V
+        ;bne _op50_nt
         jsr branch_do
         lda p4_xtra
         clc
@@ -1980,9 +1986,10 @@ _op6e_nc:
 ; $70 BVS
 op_70:
         jsr fetch_rel
-        lda p4_p
-        and #P_V
-        beq _op70_nt
+        bbr 6, p4_p, _op70_nt
+        ;lda p4_p
+        ;and #P_V
+        ;beq _op70_nt
         jsr branch_do
         lda p4_xtra
         clc
@@ -2121,7 +2128,7 @@ op_84:
         jsr fetch8
         tax
         lda p4_y
-        sta $8000,x
+        sta LOW_RAM_BUFFER,x
         lda #3
         jmp finish_cycles
 
@@ -2131,7 +2138,7 @@ op_85:
         jsr fetch8              ; Get zero page address in A
         tax
         lda p4_a
-        sta $8000,x             ; Direct write to LOW_RAM_BUFFER
+        sta LOW_RAM_BUFFER,x    ; Direct write to LOW_RAM_BUFFER          
         lda #3
         jmp finish_cycles
 
@@ -2141,7 +2148,7 @@ op_86:
         jsr fetch8
         tax
         lda p4_x
-        sta $8000,x
+        sta LOW_RAM_BUFFER,x
         lda #3
         jmp finish_cycles
 
@@ -2191,9 +2198,13 @@ op_8e:
 ; $90 BCC
 op_90:
         jsr fetch_rel
-        lda p4_p
-        and #P_C
-        bne _op90_nt
+
+        ; P_C is Bit 0. If Bit 0 is Set, we do NOT take the branch (BCC).
+        bbs 0, p4_p, _op90_nt 
+
+        ;lda p4_p
+        ;and #P_C
+        ;bne _op90_nt
         jsr branch_do
         lda p4_xtra
         clc
@@ -2306,7 +2317,7 @@ op_a4:
         ; Optimized LDY zp
         jsr fetch8
         tax
-        lda $8000,x
+        lda LOW_RAM_BUFFER,x
         sta p4_y
         jsr set_zn_a
         lda #3
@@ -2317,7 +2328,7 @@ op_a5:
         ; Optimized LDA zp - direct access to LOW_RAM_BUFFER
         jsr fetch8              ; Get zero page address in A
         tax
-        lda $8000,x             ; Direct read from LOW_RAM_BUFFER
+        lda LOW_RAM_BUFFER,x             ; Direct read from LOW_RAM_BUFFER
         sta p4_a
         jsr set_zn_a
         lda #3
@@ -2328,7 +2339,7 @@ op_a6:
         ; Optimized LDX zp
         jsr fetch8
         tax
-        lda $8000,x
+        lda LOW_RAM_BUFFER,x
         sta p4_x
         jsr set_zn_a
         lda #3
@@ -2388,9 +2399,10 @@ op_ae:
 ; $B0 BCS
 op_b0:
         jsr fetch_rel
-        lda p4_p
-        and #P_C
-        beq _opb0_nt
+        bbr 0, p4_p, _opb0_nt
+        ;lda p4_p
+        ;and #P_C
+        ;beq _opb0_nt
         jsr branch_do
         lda p4_xtra
         clc
@@ -2528,8 +2540,8 @@ op_c6:
         ; Optimized DEC zp
         jsr fetch8
         tax
-        dec $8000,x
-        lda $8000,x
+        dec LOW_RAM_BUFFER,x
+        lda LOW_RAM_BUFFER,x
         jsr set_zn_a
         lda #5
         jmp finish_cycles
@@ -2589,9 +2601,10 @@ op_ce:
 ; $D0 BNE
 op_d0:
         jsr fetch_rel
-        lda p4_p
-        and #P_Z
-        bne _opd0_nt
+        bbs 1, p4_p, _opd0_nt
+        ;lda p4_p
+        ;and #P_Z
+        ;bne _opd0_nt
         jsr branch_do
         lda p4_xtra
         clc
@@ -2707,8 +2720,8 @@ op_e6:
         ; Optimized INC zp
         jsr fetch8
         tax
-        inc $8000,x
-        lda $8000,x
+        inc LOW_RAM_BUFFER,x
+        lda LOW_RAM_BUFFER,x
         jsr set_zn_a
         lda #5
         jmp finish_cycles
@@ -2765,9 +2778,10 @@ op_ee:
 ; $F0 BEQ
 op_f0:
         jsr fetch_rel
-        lda p4_p
-        and #P_Z
-        beq _opf0_nt
+        bbr 1, p4_p, _opf0_nt
+        ;lda p4_p
+        ;and #P_Z
+        ;beq _opf0_nt
         jsr branch_do
         lda p4_xtra
         clc
