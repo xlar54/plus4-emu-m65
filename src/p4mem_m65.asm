@@ -343,18 +343,20 @@ _read_not_fd:
 read_from_ram:
         ; Set up 32-bit pointer to Plus/4 RAM address
         ; P4_RAM_PTR = [p4_addr_lo, p4_addr_hi, $05, $00]
+        ; Set up 32-bit pointer COMPLETELY each time
         lda p4_addr_lo
         sta P4_RAM_PTR
         lda p4_addr_hi
         sta P4_RAM_PTR+1
-        ; P4_RAM_PTR+2 already has $05 (bank 5)
-        ; P4_RAM_PTR+3 already has $00
+        lda #BANK_RAM           ; $05 - always set this!
+        sta P4_RAM_PTR+2
+        lda #$00
+        sta P4_RAM_PTR+3        ; always clear mega-byte!
         
         ; Use 32-bit indirect addressing: LDA [P4_RAM_PTR],Z
         ; Z register is index (use 0 for no offset)
         ldz #$00
-        nop                     ; 32-bit addressing prefix (NOP = $EA)
-        lda (P4_RAM_PTR),z      ; 32-bit indirect load
+        lda [P4_RAM_PTR],z      ; 32-bit indirect load
         rts
 
 ; ============================================================
@@ -711,18 +713,20 @@ _host_set:
 write_to_ram:
         ; Set up 32-bit pointer to Plus/4 RAM address
         ; P4_RAM_PTR = [p4_addr_lo, p4_addr_hi, $05, $00]
+        ; Set up 32-bit pointer COMPLETELY each time
         lda p4_addr_lo
         sta P4_RAM_PTR
         lda p4_addr_hi
         sta P4_RAM_PTR+1
-        ; P4_RAM_PTR+2 already has $05 (bank 5)
-        ; P4_RAM_PTR+3 already has $00
+        lda #BANK_RAM           ; $05 - always set this!
+        sta P4_RAM_PTR+2
+        lda #$00
+        sta P4_RAM_PTR+3        ; always clear mega-byte!
         
         ; Use 32-bit indirect addressing: STA [P4_RAM_PTR],Z
         ldz #$00
         lda p4_data
-        nop                     ; 32-bit addressing prefix
-        sta (P4_RAM_PTR),z      ; 32-bit indirect store
+        sta [P4_RAM_PTR],z      ; 32-bit indirect store
 
         ; If this write hits the active bitmap region, mark frame dirty
         lda p4_video_mode
