@@ -429,8 +429,13 @@ TED_CheckRasterIRQ:
         and #$01
         cmp ted_raster_hi
         bne _raster_no_match
+
+        ; Raster matches! Check if flag already set (already triggered this line)
+        lda ted_regs+$09
+        and #$02
+        bne _raster_no_match    ; Already flagged, don't re-trigger
         
-        ; Raster matches! Set raster flag (bit 1) in $FF09
+        ; Set raster flag (bit 1) in $FF09
         lda ted_regs+$09
         ora #$02                ; Set raster IRQ flag
         sta ted_regs+$09
@@ -465,7 +470,7 @@ ted_raster_hi:    .byte 0
 ; Push PC, push P (with B=0), set I flag, load vector from $FFFE
 ; ============================================================
 cpu_take_irq:
-;debug
+
         ; Push PC high
         lda p4_pc_hi
         sta p4_data
@@ -2132,19 +2137,18 @@ op_84:
         lda #3
         jmp finish_cycles
 
+
 ; $85 STA zp
 op_85:
-        ; Optimized STA zp - direct access to LOW_RAM_BUFFER
-        jsr fetch8              ; Get zero page address in A
+        jsr fetch8
         tax
         lda p4_a
-        sta LOW_RAM_BUFFER,x    ; Direct write to LOW_RAM_BUFFER          
+        sta LOW_RAM_BUFFER,x
         lda #3
         jmp finish_cycles
 
-; $86 STX zp
+; $86 STX zp  
 op_86:
-        ; Optimized STX zp
         jsr fetch8
         tax
         lda p4_x

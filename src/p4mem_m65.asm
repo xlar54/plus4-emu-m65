@@ -148,7 +148,7 @@ clear_low_ram_buffer:
 ; ============================================================
 P4MEM_Read:
         lda p4_addr_hi
-        
+
         ; Check for low RAM $0000-$0FFF (always in local buffer)
         cmp #$10
         bcs _read_not_low_ram
@@ -235,9 +235,9 @@ read_ted_register:
         cmp #$19
         beq _read_ff19
         cmp #$1C
-        beq _read_raster_lo
+        beq _read_raster_hi     ; $FF1C = high bit (bit 8 of raster)
         cmp #$1D
-        beq _read_raster_hi
+        beq _read_raster_lo     ; $FF1D = low byte of raster
         
         tax
         lda ted_regs,x
@@ -351,10 +351,10 @@ P4MEM_Write:
 _write_low:
         sta LOW_RAM_BUFFER,x            ; High byte modified
 
-        ; If we're in bitmap present mode, don't mirror text/color to host
+        ; If we're in bitmap mode, don't mirror text/color to host
         lda p4_video_mode
-        beq _mirror_check
-        pla                             ; discard saved page
+        beq _mirror_check               ; Text mode - always mirror
+        pla                             ; Bitmap mode - skip mirror
         rts
 _mirror_check:
         
@@ -595,10 +595,31 @@ _host_set:
 ; Video mode switching
 ; ============================================================
 P4VID_GfxConfigChanged:
+        ; If GRAPHIC 2 mode (bit 6 of $0083 set), always stay in bitmap mode
+        ; This prevents the Plus/4's split screen IRQ from toggling our display
+        lda LOW_RAM_BUFFER + $83
+        and #$40                ; Check bit 6 (split screen flag)
+        beq _gfx_check_normal   ; Not GRAPHIC 2, handle normally
+        
+        ; GRAPHIC 2 mode - force bitmap mode, ignore TED $FF06 toggling
+        lda ted_regs+$06
+        and #$20
+        beq _gfx_g2_done        ; If Plus/4 switched to text phase, just ignore it
+        
+        ; Plus/4 is in bitmap phase - update if needed
+        lda p4_video_mode
+        bne _gfx_g2_done        ; Already in bitmap mode
+        bra _gfx_enter_bitmap   ; Enter bitmap mode
+        
+_gfx_g2_done:
+        rts
+
+_gfx_check_normal:
         lda ted_regs+$06
         and #$20                ; Check bitmap mode bit (bit 5)
         beq _gfx_to_text
 
+_gfx_enter_bitmap:
         ; Enter bitmap mode - determine if multicolor
         lda #1
         sta p4_video_mode
@@ -849,6 +870,9 @@ _fill2:
         cpx #$E8
         bne _fill2
         rts
+
+; Split screen mode not implemented - GRAPHIC 2 acts like GRAPHIC 1
+
 ; ============================================================
 ; TED to C64 color mapping table (128 entries)
 ; ============================================================

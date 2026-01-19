@@ -233,17 +233,6 @@ _wait:
         jsr GETIN
         beq _wait
 
-        ; ----------------------------------------------------
-        ; Disable interrupts for emulation
-        ; ----------------------------------------------------
-        sei
-        lda #$7F
-        sta $DC0D
-        sta $DD0D
-        lda $DC0D
-        lda $DD0D
-        lda #$00
-        sta $D01A
 
         ; ----------------------------------------------------
         ; Reset Plus/4 CPU and start emulation
