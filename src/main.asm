@@ -240,8 +240,22 @@ _wait:
         jsr P4CPU_Reset
         
 main_loop:
-        ;jsr output_emulator_steps
+
+        ; --- Check if print requested ---
+        lda p4h_print_pending
+        beq _no_print_start
+        jsr P4Host_StartPrint
+
+_no_print_start:
         jsr P4CPU_Step
+
+        ; --- If printing, check if done ---
+        lda p4h_print_active
+        beq _no_print_check
+        jsr P4Host_CheckPrintDone   ; C=1 when done
+
+_no_print_check:
+
         jmp main_loop
 
 ; ============================================================
@@ -424,3 +438,4 @@ fail_msg:
         .include "plus4_cpu_m65.asm"
         .include "p4hooks.asm"
         .include "p4mem_m65.asm"
+        .include "p4host.asm"
