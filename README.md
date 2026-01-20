@@ -2,6 +2,8 @@
 
 This is a simple Commodore Plus 4 emulator for the Mega65 computer
 
+The latest build is in the Target directory as a d81
+
 It uses screen mirroring rather than scanline rendering to make it faster than it would be otherwise.
 
 Current Features:
