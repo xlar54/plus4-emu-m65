@@ -134,7 +134,7 @@ _k_done:
         .byte $00                       ; copy
         .word $0002                     ; count = 2
         .byte $00, $C0, $04             ; src: $C000, bank 4
-        .byte $00, $40, $00             ; dst: $4000, bank 0
+        .byte $00, $A0, $00             ; dst: $4000, bank 0
         .byte $00
         .word $0000
 
@@ -196,7 +196,7 @@ _b_done:
         .byte $00                ; command = copy
         .word $0100              ; count = 256
         .byte $00, $FF, $04      ; src: $FF00, bank 4
-        .byte $00, $40, $00      ; dst: $4000, bank 0
+        .byte $00, $A0, $00      ; dst: $4000, bank 0
         .byte $00                ; cmd hi
         .word $0000              ; modulo
 
@@ -422,4 +422,5 @@ fail_msg:
 ; Include emulator components
 ; ============================================================
         .include "plus4_cpu_m65.asm"
+        .include "p4hooks.asm"
         .include "p4mem_m65.asm"

@@ -601,6 +601,11 @@ _step_execute:
         sta p4_inst_pc_lo
         lda p4_pc_hi
         sta p4_inst_pc_hi
+
+        ; --------------------------------------------------------
+        ; BASIC/KERNAL hooks (host-side traps)
+        ; --------------------------------------------------------
+        jsr P4HOOK_CheckAndRun
         
         jsr fetch8
         
