@@ -19,6 +19,14 @@ P4_SETNAM               = $FFBD         ; SETNAM entry point
 P4_SETLFS               = $FFBA         ; SETLFS entry point  
 P4_LOAD                 = $FFD5         ; LOAD entry point
 P4_SAVE                 = $FFD8         ; SAVE entry point
+; Additional KERNAL entries used for DIRECTORY (host-side)
+P4_OPEN                 = $FFC0         ; OPEN
+P4_CLOSE                = $FFC3         ; CLOSE
+P4_CHKIN                = $FFC6         ; CHKIN
+P4_CLRCHN               = $FFCC         ; CLRCHN
+P4_CHRIN                = $FFCF         ; CHRIN
+P4_READST               = $FFB7         ; READST
+
 
 ; Inside BASIC LOAD handler: the JSR $FFD5 instruction
 P4HOOK_ROM_LOAD_KERNAL_CALL      = $A800
@@ -152,7 +160,7 @@ _not_ff:
         lda p4_pc_lo
         cmp #$BC                        ; DIRECTORY = $C8BC
         bne _done
-        jsr P4HOOK_OnDIRECTORY_New
+        jsr P4HOOK_OnDIRECTORY
         jmp _done
 
 _check_a8:
@@ -405,25 +413,94 @@ _cf_error:
 
 ; ============================================================
 ; P4HOOK_DoHostLoad - Load file using host MEGA65 KERNAL
+;
+; The MEGA65 KERNAL LOAD with SA=0 reads the 2-byte header but then
+; loads to the address we specify in X/Y (ignoring header address).
+; The header bytes are NOT placed in our buffer.
+;
+; For SA=0 (load to TXTTAB): We just use LOAD directly, data goes 
+; straight to our buffer, then DMA to TXTTAB.
+;
+; For SA!=0 (load to file's address): We need to know the header
+; address. We first OPEN/CHRIN to read the 2-byte header, close,
+; then use LOAD to get the data.
 ; ============================================================
+
+; Storage for the captured PRG header (load address)
+p4_prg_header_lo: .byte 0
+p4_prg_header_hi: .byte 0
+
 P4HOOK_DoHostLoad:
-        ; Set up host KERNAL for load
+        ; Set up host KERNAL for file operations
         lda #$00
         ldx #$00
         jsr SETBNK
         
+        ; Check if we need the header address (SA != 0)
+        lda p4_setlfs_sa
+        beq _dhl_do_load            ; SA=0, skip header reading
+        
+        ; --------------------------------------------------------
+        ; SA != 0: Need to read header address first
+        ; --------------------------------------------------------
+        ; Set filename for OPEN
+        ldx #<p4_fl_buf
+        ldy #>p4_fl_buf
+        lda p4_fl_len
+        jsr SETNAM
+        
+        ; SETLFS: lfn=15, device, sa=15 (command channel style read)
+        lda #$0F                        ; Logical file number 15
+        ldx p4_setlfs_dev
+        bne +
+        ldx #$08                        ; Default to device 8
++       ldy #$00                        ; SA=0 for sequential
+        jsr SETLFS
+        
+        jsr OPEN
+        bcs _dhl_header_error
+        
+        ; CHKIN to file 15
+        ldx #$0F
+        jsr CHKIN
+        bcs _dhl_header_chkin_error
+        
+        ; Read header bytes
+        jsr CHRIN
+        sta p4_prg_header_lo
+        jsr CHRIN
+        sta p4_prg_header_hi
+        
+        ; Close
+        jsr CLRCHN
+        lda #$0F
+        jsr CLOSE
+        jmp _dhl_do_load_after_header
+
+_dhl_header_error:
+_dhl_header_chkin_error:
+        jsr CLRCHN
+        lda #$0F
+        jsr CLOSE
+        jmp _dhl_error_set
+
+_dhl_do_load_after_header:
+_dhl_do_load:
+        ; --------------------------------------------------------
+        ; Use LOAD to read file data into staging buffer
+        ; --------------------------------------------------------
         ; Set filename
         ldx #<p4_fl_buf
         ldy #>p4_fl_buf
         lda p4_fl_len
         jsr SETNAM
         
-        ; Set device (use captured device, default to 8)
+        ; SETLFS: lfn=1, device, sa=0 (we provide our own address)
         lda #$01                        ; Logical file number
         ldx p4_setlfs_dev
         bne +
         ldx #$08                        ; Default to device 8
-+       ldy p4_setlfs_sa                ; Secondary address
++       ldy #$00                        ; SA=0: use X/Y address, not file header
         jsr SETLFS
         
         ; Load to staging buffer
@@ -431,17 +508,12 @@ P4HOOK_DoHostLoad:
         ldx #<P4_DIR_BUF
         ldy #>P4_DIR_BUF
         jsr LOAD
-        bcc _dhl_ok
+        bcc _dhl_load_ok
         
         ; Load failed
-        lda p4_p
-        ora #P_C
-        sta p4_p
-        lda #$04                        ; FILE NOT FOUND error
-        sta p4_a
-        jmp _dhl_set_pc
+        jmp _dhl_error_set
 
-_dhl_ok:
+_dhl_load_ok:
         ; Save end address from LOAD (in X/Y)
         stx p4_fl_end_lo
         sty p4_fl_end_hi
@@ -451,14 +523,10 @@ _dhl_ok:
         ldx #>P4Host_Msg_Loading
         jsr P4Host_PrintString
         
-        ; Restore end address
-        ldx p4_fl_end_lo
-        ldy p4_fl_end_hi
-        
         ; Calculate loaded length
-        stx p4_fl_end_lo
-        sty p4_fl_end_hi
-        
+        ; The KERNAL LOAD with SA=0 loads to our X/Y address
+        ; and returns end address in X/Y
+        ; Length = end - start (no header in buffer)
         lda p4_fl_end_lo
         sec
         sbc #<P4_DIR_BUF
@@ -467,16 +535,15 @@ _dhl_ok:
         sbc #>P4_DIR_BUF
         sta p4_dir_len_hi
         
-        ; Need at least 2 bytes (load address header)
+        ; Need at least 1 byte of data
         lda p4_dir_len_hi
         bne _dhl_has_data
         lda p4_dir_len_lo
-        cmp #2
-        bcc _dhl_error
+        beq _dhl_error_set
 
 _dhl_has_data:
         ; Determine destination address
-        ; SA=0: use TXTTAB, SA!=0: use file header address
+        ; SA=0: use TXTTAB, SA!=0: use file header address we captured
         lda p4_setlfs_sa
         bne _dhl_use_file_addr
         
@@ -488,23 +555,15 @@ _dhl_has_data:
         jmp _dhl_do_copy
 
 _dhl_use_file_addr:
-        ; Use address from file header (first 2 bytes)
-        lda P4_DIR_BUF
+        ; Use address from PRG header we captured earlier
+        lda p4_prg_header_lo
         sta p4_dir_dest_lo
-        lda P4_DIR_BUF+1
+        lda p4_prg_header_hi
         sta p4_dir_dest_hi
 
 _dhl_do_copy:
-        ; Subtract 2 from length (skip header)
-        lda p4_dir_len_lo
-        sec
-        sbc #2
-        sta p4_dir_len_lo
-        lda p4_dir_len_hi
-        sbc #0
-        sta p4_dir_len_hi
-        
-        ; DMA copy to guest memory (skip 2-byte header)
+        ; DMA copy to guest memory
+        ; Buffer contains only data (no header)
         jsr P4HOOK_DMACopyFileToGuest
         
         ; Clear KERNAL status
@@ -526,11 +585,11 @@ _dhl_do_copy:
         sta p4_p
         jmp _dhl_set_pc
 
-_dhl_error:
+_dhl_error_set:
         lda p4_p
         ora #P_C
         sta p4_p
-        lda #$04
+        lda #$04                        ; FILE NOT FOUND error
         sta p4_a
 
 _dhl_set_pc:
@@ -873,7 +932,10 @@ _ld_end_hi: .byte 0
 
 
 ; ============================================================
-; DMA copy file data (skip 2-byte header) to guest RAM
+; DMA copy file data to guest RAM
+; Source: P4_DIR_BUF (staging buffer - data only, no header)
+; Dest: p4_dir_dest in Bank 5 (guest RAM)
+; Length: p4_dir_len
 ; ============================================================
 P4HOOK_DMACopyFileToGuest:
         lda p4_dir_len_lo
@@ -893,8 +955,8 @@ _dma_fl_len_lo:
         .byte $00
 _dma_fl_len_hi:
         .byte $00
-        .byte <(P4_DIR_BUF+2)           ; src lo (skip 2-byte header)
-        .byte >(P4_DIR_BUF+2)           ; src hi
+        .byte <P4_DIR_BUF               ; src lo (buffer contains data only)
+        .byte >P4_DIR_BUF               ; src hi
         .byte $00                       ; src bank 0
 _dma_fl_dst_lo:
         .byte $00
@@ -993,56 +1055,282 @@ P4MEM_WriteA0:
 ; ============================================================
 
 ; Called when PC = $C8BC (DIRECTORY keyword entry)
-P4HOOK_OnDIRECTORY_New:
-        ; Load directory from host SD card
+P4HOOK_OnDIRECTORY:
+        ; ------------------------------------------------------------
+        ; DIRECTORY hook (print-only, do not alter BASIC program memory)
+        ;
+        ; We mimic the ROM strategy: OPEN a directory channel and read
+        ; bytes via CHRIN, sending them to the guest console.
+        ;
+        ; We try secondary address $60 first (what the Plus/4 KERNAL uses),
+        ; and fall back to $00 if needed on the host filesystem.
+        ; ------------------------------------------------------------
+
+        ; Ensure host KERNAL I/O uses bank 0
         lda #$00
         ldx #$00
         jsr SETBNK
 
+        ; Name = "$"
         ldx #<p4_dir_name
         ldy #>p4_dir_name
         lda #$01
         jsr SETNAM
 
-        lda #$01
+        ; Try OPEN with SA=$60 (Plus/4 style)
+        lda #$02                        ; logical file #
+        ldx #$08                        ; device 8
+        ldy #$60                        ; secondary for directory
+        jsr SETLFS
+        jsr P4_OPEN
+
+        jsr P4_READST
+        beq _dir_open_ok
+
+        ; Fall back: try OPEN with SA=$00
+        lda #$02
+        jsr P4_CLOSE
+
+        lda #$02
         ldx #$08
         ldy #$00
         jsr SETLFS
+        jsr P4_OPEN
 
-        ; Load directory to staging buffer
-        lda #$00                        ; LOAD (not verify)
-        ldx #<P4_DIR_BUF
-        ldy #>P4_DIR_BUF
-        jsr LOAD
-        bcc _dir_new_ok
-        
-        ; Load failed - just return to BASIC
-        jsr P4HOOK_RTS_Guest
+        jsr P4_READST
+        bne _dir_open_fail
+
+_dir_open_ok:
+        ; Make it the current input channel
+        ldx #$02
+        jsr P4_CHKIN
+
+        ; ---- Directory stream is a BASIC "program" ----
+        ; First two bytes are the LOAD address ($0401 typically). Discard them.
+        jsr P4_CHRIN
+        jsr P4_CHRIN
+
+_dir_line_loop:
+        ; If EOF flagged, bail (safety)
+        jsr P4_READST
+        and #$40                        ; EOF?
+        bne _dir_done
+
+        ; Read next-line pointer (lo/hi)
+        jsr P4_CHRIN
+        sta _dir_nextptr
+        jsr P4_CHRIN
+        sta _dir_nextptr+1
+
+        ; 0000 means end-of-program
+        lda _dir_nextptr
+        ora _dir_nextptr+1
+        beq _dir_done
+
+        ; Read "line number" (lo/hi) which is blocks used/free
+        jsr P4_CHRIN
+        sta _dir_blocks
+        jsr P4_CHRIN
+        sta _dir_blocks+1
+
+        jsr _dir_print_blocks_u16_left4_sp   ; prints number + pads + trailing space
+
+
+        ; Print text bytes until $00 (end of line)
+_dir_text_loop:
+        jsr P4_CHRIN
+        beq _dir_eol
+
+        ; D81/1581 padding uses $A0 - treat it like space
+        cmp #$A0
+        bne _dir_put
+        lda #$20
+_dir_put:
+        jsr P4Host_PutChar
+        jmp _dir_text_loop
+
+_dir_eol:
+        ; End of "line" -> newline
+        lda #$0D
+        jsr P4Host_PutChar
+        jmp _dir_line_loop
+
+
+; ------------------------------------------------------------
+; Helpers / locals (place these near your hook code)
+; ------------------------------------------------------------
+
+; Storage (not ZP, avoids collisions)
+_dir_nextptr:   .word 0
+_dir_blocks:    .word 0
+
+; ------------------------------------------------------------
+; Print _dir_blocks as decimal, LEFT-justified in 4 columns,
+; then print one trailing space (total width = 5).
+; Examples:
+;   0    -> "0   "
+;   39   -> "39  "
+;   65   -> "65  "
+;   2991 -> "2991"
+; then it always adds one extra space after the 4-col field.
+; ------------------------------------------------------------
+_dir_print_blocks_u16_left4_sp:
+        ; Copy blocks to work
+        lda _dir_blocks
+        sta _dir_work
+        lda _dir_blocks+1
+        sta _dir_work+1
+
+        lda #0
+        sta _dir_ndig
+
+        ; Print digits (no leading spaces). Use repeated subtraction like before.
+        ; 1000s
+        lda #<1000
+        sta _dir_div
+        lda #>1000
+        sta _dir_div+1
+        jsr _dir_emit_digit_nolead
+
+        ; 100s
+        lda #<100
+        sta _dir_div
+        lda #>100
+        sta _dir_div+1
+        jsr _dir_emit_digit_nolead
+
+        ; 10s
+        lda #<10
+        sta _dir_div
+        lda #>10
+        sta _dir_div+1
+        jsr _dir_emit_digit_nolead
+
+        ; 1s (always printed)
+        lda #<1
+        sta _dir_div
+        lda #>1
+        sta _dir_div+1
+        jsr _dir_emit_last_digit_counted
+
+        ; Pad to 4 columns (left-justified)
+        lda _dir_ndig
+        cmp #1
+        bcs _dir_pad_done
+_dir_pad_loop:
+        lda #$20
+        jsr P4Host_PutChar
+        inc _dir_ndig
+        lda _dir_ndig
+        cmp #4
+        bcc _dir_pad_loop
+_dir_pad_done:
+        ; One trailing separator space
+        lda #$20
+        jmp P4Host_PutChar
+
+
+_dir_ndig:      .byte 0
+
+; Like your existing digit subtractor, but:
+; - does NOT output anything for leading zeros
+; - increments _dir_ndig when it prints a digit
+_dir_emit_digit_nolead:
+        ldy #0
+_dir_sub_loop_nl:
+        lda _dir_work+1
+        cmp _dir_div+1
+        bcc _dir_sub_done_nl
+        bne _dir_can_sub_nl
+        lda _dir_work
+        cmp _dir_div
+        bcc _dir_sub_done_nl
+_dir_can_sub_nl:
+        lda _dir_work
+        sec
+        sbc _dir_div
+        sta _dir_work
+        lda _dir_work+1
+        sbc _dir_div+1
+        sta _dir_work+1
+        iny
+        cpy #10
+        bne _dir_sub_loop_nl
+_dir_sub_done_nl:
+        ; If digit is zero and no digits printed yet, output nothing
+        tya
+        bne _dir_print_digit_nl
+        lda _dir_ndig
+        beq _dir_emit_digit_nl_rts
+        lda #'0'
+        jsr P4Host_PutChar
+        inc _dir_ndig
+        rts
+_dir_print_digit_nl:
+        tya
+        clc
+        adc #'0'
+        jsr P4Host_PutChar
+        inc _dir_ndig
+_dir_emit_digit_nl_rts:
         rts
 
-_dir_new_ok:
-        ; Save end address
-        stx p4dir_end_lo
-        sty p4dir_end_hi
-        
-        ; Calculate length
-        lda p4dir_end_lo
+; Ones place: always print, and count it
+_dir_emit_last_digit_counted:
+        ldy #0
+_dir_sub_loop_1c:
+        lda _dir_work+1
+        cmp _dir_div+1
+        bcc _dir_sub_done_1c
+        bne _dir_can_sub_1c
+        lda _dir_work
+        cmp _dir_div
+        bcc _dir_sub_done_1c
+_dir_can_sub_1c:
+        lda _dir_work
         sec
-        sbc #<P4_DIR_BUF
-        sta p4dir_len_lo
-        lda p4dir_end_hi
-        sbc #>P4_DIR_BUF
-        sta p4dir_len_hi
-        
-        ; Parse and print directory listing
-        jsr P4HOOK_PrintDirectory
-        
+        sbc _dir_div
+        sta _dir_work
+        lda _dir_work+1
+        sbc _dir_div+1
+        sta _dir_work+1
+        iny
+        cpy #10
+        bne _dir_sub_loop_1c
+_dir_sub_done_1c:
+        tya
+        clc
+        adc #'0'
+        jsr P4Host_PutChar
+        inc _dir_ndig
+        rts
+
+_dir_work:
+        .byte $00, $00
+_dir_div:
+        .byte $00, $00
+
+_dir_done:
+        jsr P4_CLRCHN
+        lda #$02
+        jsr P4_CLOSE
+
         ; Return to BASIC via RTS
         jsr P4HOOK_RTS_Guest
         rts
 
-p4dir_end_lo: .byte 0
+_tmplinectr:
+        .byte $00
+
+_dir_open_fail:
+        ; Couldn't open directory channel. Just return to BASIC.
+        jsr P4HOOK_RTS_Guest
+        rts
+
+
+ .byte 0
 p4dir_end_hi: .byte 0
+p4dir_end_lo: .byte 0
 p4dir_len_lo: .byte 0
 p4dir_len_hi: .byte 0
 
@@ -1103,19 +1391,19 @@ _dir_process_line:
         
         ; Print space
         lda #' '
-        jsr CHROUT
+        jsr P4Host_PutChar
         
         ; Print rest of line until null
 _dir_print_chars:
         jsr _dir_read_byte
         beq _dir_line_done              ; Null = end of line
-        jsr CHROUT
+        jsr P4Host_PutChar
         jmp _dir_print_chars
         
 _dir_line_done:
         ; Print newline
         lda #$0d
-        jsr CHROUT
+        jsr P4Host_PutChar
         
         ; Next line
         jmp _dir_next_line
@@ -1171,7 +1459,7 @@ _print_10000:
 _print_10000_digit:
         clc
         adc #'0'
-        jsr CHROUT
+        jsr P4Host_PutChar
         ldy #1                          ; No longer leading
 _skip_10000:
 
@@ -1198,7 +1486,7 @@ _print_1000:
 _print_1000_digit:
         clc
         adc #'0'
-        jsr CHROUT
+        jsr P4Host_PutChar
         ldy #1
 _skip_1000:
 
@@ -1221,7 +1509,7 @@ _print_100:
 _print_100_digit:
         clc
         adc #'0'
-        jsr CHROUT
+        jsr P4Host_PutChar
         ldy #1
 _skip_100:
 
@@ -1244,14 +1532,14 @@ _print_10:
 _print_10_digit:
         clc
         adc #'0'
-        jsr CHROUT
+        jsr P4Host_PutChar
 _skip_10:
 
         ; 1s place - always print
         lda _dir_blocks_lo
         clc
         adc #'0'
-        jsr CHROUT
+        jsr P4Host_PutChar
         
         rts
 
@@ -1262,212 +1550,8 @@ _dir_blocks_hi: .byte 0
 _dir_digit:     .byte 0
 
 
-; ============================================================
-; DIRECTORY support (preserved from original - may not be needed)
-; ============================================================
 
-P4HOOK_OnDIRECTORY:
-        jsr P4HOOK_SaveBasicPtrs
-        jsr P4HOOK_ComputeTempDest
 
-        lda #$00
-        ldx #$00
-        jsr SETBNK
-
-        ldx #<p4_dir_name
-        ldy #>p4_dir_name
-        lda #$01
-        jsr SETNAM
-
-        lda #$01
-        ldx #$08
-        ldy #$00
-        jsr SETLFS
-
-        lda #$40
-        ldx #<P4_DIR_BUF
-        ldy #>P4_DIR_BUF
-        jsr LOAD
-        bcc _dir_ok
-        jsr P4HOOK_RTS_Guest
-        rts
-
-_dir_ok:
-        stx _d_end_lo
-        sty _d_end_hi
-
-        lda _d_end_lo
-        sec
-        sbc #<P4_DIR_BUF
-        sta p4_dir_len_lo
-        lda _d_end_hi
-        sbc #>P4_DIR_BUF
-        sta p4_dir_len_hi
-
-        lda p4_dir_temp_lo
-        sta p4_dir_dest_lo
-        lda p4_dir_temp_hi
-        sta p4_dir_dest_hi
-
-        lda p4_dir_len_lo
-        ora p4_dir_len_hi
-        beq _dir_call_list
-        jsr P4HOOK_DMACopyDirToGuest
-
-_dir_call_list:
-        jsr P4HOOK_PointBasicToTemp
-
-        lda #<(P4HOOK_DIR_RESTORE_TRAP-1)
-        ldx #>(P4HOOK_DIR_RESTORE_TRAP-1)
-        jsr P4HOOK_PushJSRReturn_AX
-
-        lda #<P4HOOK_ROM_PERFORM_LIST
-        sta p4_pc_lo
-        lda #>P4HOOK_ROM_PERFORM_LIST
-        sta p4_pc_hi
-        rts
-
-_d_end_lo: .byte 0
-_d_end_hi: .byte 0
-
-P4HOOK_OnDIRECTORY_Restore:
-        jsr P4HOOK_RestoreBasicPtrs
-        jsr P4HOOK_RTS_Guest
-        rts
-
-P4HOOK_SaveBasicPtrs:
-        lda #$00
-        sta p4_addr_hi
-        ldx #$00
-_save_loop:
-        txa
-        clc
-        adc #ZP_PTRS_BASE
-        sta p4_addr_lo
-        jsr P4MEM_Read
-        sta p4_saved_basic_ptrs,x
-        inx
-        cpx #ZP_PTRS_COUNT
-        bne _save_loop
-        rts
-
-P4HOOK_RestoreBasicPtrs:
-        lda #$00
-        sta p4_addr_hi
-        ldx #$00
-_restore_loop:
-        txa
-        clc
-        adc #ZP_PTRS_BASE
-        sta p4_addr_lo
-        lda p4_saved_basic_ptrs,x
-        jsr P4MEM_WriteA
-        inx
-        cpx #ZP_PTRS_COUNT
-        bne _restore_loop
-        rts
-
-P4HOOK_ComputeTempDest:
-        lda #$00
-        sta p4_addr_hi
-        lda #ZP_TOPMEM_LO
-        sta p4_addr_lo
-        jsr P4MEM_Read
-        sta _top_lo
-        lda #ZP_TOPMEM_HI
-        sta p4_addr_lo
-        jsr P4MEM_Read
-        sta _top_hi
-
-        lda _top_lo
-        sec
-        sbc #$00
-        sta p4_dir_temp_lo
-        lda _top_hi
-        sbc #$10
-        sta p4_dir_temp_hi
-
-        lda #$00
-        sta p4_dir_temp_lo
-        rts
-
-_top_lo: .byte 0
-_top_hi: .byte 0
-
-P4HOOK_PointBasicToTemp:
-        lda #$00
-        sta p4_addr_hi
-
-        lda #ZP_TXTTAB_LO
-        sta p4_addr_lo
-        lda p4_dir_temp_lo
-        jsr P4MEM_WriteA
-
-        lda #ZP_TXTTAB_HI
-        sta p4_addr_lo
-        lda p4_dir_temp_hi
-        jsr P4MEM_WriteA
-
-        clc
-        lda p4_dir_temp_lo
-        adc p4_dir_len_lo
-        sta _vt_lo
-        lda p4_dir_temp_hi
-        adc p4_dir_len_hi
-        sta _vt_hi
-
-        ldx #$00
-_set_vt_loop:
-        txa
-        clc
-        adc #ZP_VARTAB_LO
-        sta p4_addr_lo
-
-        txa
-        and #$01
-        beq _vt_write_lo
-_vt_write_hi:
-        lda _vt_hi
-        jsr P4MEM_WriteA
-        inx
-        cpx #$08
-        bne _set_vt_loop
-        rts
-_vt_write_lo:
-        lda _vt_lo
-        jsr P4MEM_WriteA
-        inx
-        cpx #$08
-        bne _set_vt_loop
-        rts
-
-_vt_lo: .byte 0
-_vt_hi: .byte 0
-
-P4HOOK_PushJSRReturn_AX:
-        sta tmp_lo
-        stx tmp_hi
-
-        ldy p4_sp
-
-        lda #$01
-        sta p4_addr_hi
-        tya
-        sta p4_addr_lo
-        lda tmp_hi
-        jsr P4MEM_WriteA
-        dey
-
-        lda #$01
-        sta p4_addr_hi
-        tya
-        sta p4_addr_lo
-        lda tmp_lo
-        jsr P4MEM_WriteA
-        dey
-
-        sty p4_sp
-        rts
 
 P4HOOK_RTS_Guest:
         ldy p4_sp
