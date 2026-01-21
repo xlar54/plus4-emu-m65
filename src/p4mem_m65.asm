@@ -163,21 +163,15 @@ _read_low:
         rts
         
 _read_not_low_ram:
-        ; Check for I/O area ($FF00-$FF3F)
+        ; Check for I/O area ($FF00-$FF3F) - TED registers
         cmp #$FF
         bne _read_not_ff
         lda p4_addr_lo
         cmp #$40
         bcs _read_ff40_plus             ; $FF40+ -> KERNAL ROM
-        cmp #$20
-        bcs _read_ff20_3f               ; $FF20-$FF3F -> not TED, check further
         
-        ; TED registers $FF00-$FF1F
+        ; $FF00-$FF3F: ALL are TED registers (with $FF20-$FF3F mirroring $FF00-$FF1F)
         jmp read_ted_register
-
-_read_ff20_3f:
-        ; $FF20-$FF3F: Read from KERNAL ROM
-        jmp read_from_kernal
 
 _read_ff40_plus:
         ; $FF40-$FFFF: KERNAL ROM
@@ -224,14 +218,19 @@ read_ram_direct:
         rts
 
 ; ============================================================
-; read_ted_register - Handle TED register reads $FF00-$FF1F
+; read_ted_register - Handle TED register reads $FF00-$FF3F
+; $FF20-$FF3F mirrors $FF00-$FF1F
 ; ============================================================
 read_ted_register:
         lda p4_addr_lo
+        and #$1F                        ; Mask to $00-$1F (handle mirroring)
+        
         cmp #$08
         beq _read_keyboard
         cmp #$15
         beq _read_ff15
+        cmp #$16
+        beq _read_ff16              ; RAM size / memory config register
         cmp #$19
         beq _read_ff19
         cmp #$1C
@@ -246,6 +245,15 @@ read_ted_register:
 _read_ff15:
         lda ted_regs+$15
         ora #$80
+        rts
+
+_read_ff16:
+        ; $FF16 is the RAM size / memory configuration register
+        ; On Plus/4 (64KB): reading returns $C0 (bits 7,6 set) regardless of what was written
+        ; On C16 (16KB): reading returns $00 or $40
+        ; We emulate a Plus/4 with 64KB, so always return with bits 7,6 set
+        lda ted_regs+$16
+        ora #$C0                        ; Set bits 7 and 6 for 64KB Plus/4
         rts
 
 _read_ff19:
@@ -412,10 +420,11 @@ _write_not_ff3f:
         rts
 
 _write_not_ff3e:
-        cmp #$20
-        bcs _write_to_ram               ; $FF20+ -> RAM under ROM
+        cmp #$40
+        bcs _write_to_ram               ; $FF40+ -> RAM under ROM
         
-        ; TED registers $FF00-$FF1F
+        ; $FF00-$FF3F: ALL are TED registers (with $FF20-$FF3F mirroring $FF00-$FF1F)
+        and #$1F                        ; Mask to $00-$1F (handle mirroring)
         tax
         lda p4_data
         sta ted_regs,x
