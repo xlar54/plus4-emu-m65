@@ -27,6 +27,10 @@ P4_CLRCHN               = $FFCC         ; CLRCHN
 P4_CHRIN                = $FFCF         ; CHRIN
 P4_READST               = $FFB7         ; READST
 
+; MEGA65 KERNAL routines for output
+CHKOUT                  = $FFC9         ; Set output channel
+;CHROUT                  = $FFD2         ; Output character
+
 
 ; Inside BASIC LOAD handler: the JSR $FFD5 instruction
 P4HOOK_ROM_LOAD_KERNAL_CALL      = $A800
@@ -267,7 +271,7 @@ P4HOOK_OnLOAD:
         sta P4_MEM_PTR
         lda p4_setnam_ptr_hi
         sta P4_MEM_PTR+1
-        lda #BANK_RAM
+        lda #P4_BANK_RAM
         sta P4_MEM_PTR+2
         lda #$00
         sta P4_MEM_PTR+3
@@ -373,7 +377,7 @@ P4HOOK_CopyFilename:
         sta P4_MEM_PTR
         lda p4_setnam_ptr_hi
         sta P4_MEM_PTR+1
-        lda #BANK_RAM                   ; Bank 5 = guest RAM
+        lda #P4_BANK_RAM                   ; Bank 5 = guest RAM
         sta P4_MEM_PTR+2
         lda #$00
         sta P4_MEM_PTR+3
@@ -661,6 +665,9 @@ _save_error:
 
 ; ============================================================
 ; P4HOOK_DoHostSave - Save file using host MEGA65 KERNAL
+;
+; MEGA65 KERNAL SAVE with SA=1 prepends the 2-byte load address.
+; We copy data to P4_DIR_BUF (no header), and let KERNAL add header.
 ; ============================================================
 P4HOOK_DoHostSave:
         ; Calculate data length
@@ -678,16 +685,8 @@ P4HOOK_DoHostSave:
         ora p4_dir_len_lo
         beq _dhs_error                  ; Zero length = error
         
-        ; DMA copy from guest RAM to staging buffer
-        ; First 2 bytes = load address header
-        lda p4_save_start_lo
-        sta P4_DIR_BUF
-        lda p4_save_start_hi
-        sta P4_DIR_BUF+1
-        
-        ; Copy program data from guest RAM (bank 5) to staging buffer+2
+        ; DMA copy from guest RAM to staging buffer (data only at P4_DIR_BUF)
         jsr P4HOOK_DMACopyGuestToHost
-
 
         ; Print "SAVING "
         lda #<P4Host_Msg_Saving
@@ -701,7 +700,7 @@ P4HOOK_DoHostSave:
         beq _print_done
         lda p4_fl_buf,y
         phy
-        jsr P4Host_PutChar          ; (alias for P4Host_PrintCharSync)
+        jsr P4Host_PutChar
         ply
         iny
         bne _print_name
@@ -718,43 +717,119 @@ P4HOOK_DoHostSave:
         lda p4_fl_len
         jsr SETNAM
         
-        ; Set device
+        ; Set device - SA=1 means KERNAL adds the 2-byte header
         lda #$01                        ; Logical file number
         ldx p4_setlfs_dev
         bne +
         ldx #$08                        ; Default to device 8
-+       ldy #$01                        ; SA=1 for save with relocate address
++       ldy #$01                        ; SA=1: KERNAL prepends load address
         jsr SETLFS
         
-        ; Calculate total length including 2-byte header
-        clc
-        lda p4_dir_len_lo
-        adc #2
-        sta _save_total_lo
-        lda p4_dir_len_hi
-        adc #0
-        sta _save_total_hi
+        ; For SAVE with SA=1:
+        ; - ZP pointer ($FB/$FC) contains the START ADDRESS (used as PRG header)
+        ; - Data is read starting FROM that address
+        ; - X/Y = end address (exclusive)
+        ;
+        ; We need to save data from P4_DIR_BUF, but header should be guest start addr
+        ; Trick: Put guest start address in $FB/$FC, but that's not where data is!
+        ;
+        ; Actually KERNAL SAVE reads: header from ($FB), data from ($FB) to X/Y
+        ; So we need ($FB) to point to our buffer, and buffer[0:1] to be start addr
+        ;
+        ; Wait no - KERNAL uses the VALUE at ($FB) as both header AND data start.
+        ; So if ($FB)=$1001, it writes $01 $10 as header, then reads from $1001.
+        ;
+        ; We need to put start address at beginning of buffer so KERNAL reads it.
+        ; Then point $FB to (P4_DIR_BUF - 2) so KERNAL reads header from buf[0:1]
+        ; and data from buf[2:]... no that won't work either.
+        ;
+        ; Simpler: Write guest start addr to $FB/$FC. KERNAL writes that as header.
+        ; Then it tries to read data from $1001 which is wrong (we have it in buffer).
+        ;
+        ; SOLUTION: Don't use KERNAL SAVE. Use OPEN/CHROUT to write raw bytes.
         
-        ; SAVE - A = ZP pointer to start, X/Y = end address
-        ; Set up a ZP pointer to P4_DIR_BUF
+        ; For now, let's try putting the header in the buffer and telling KERNAL
+        ; the start address is P4_DIR_BUF (so it reads header correctly)
+        ; But then header in file will be P4_DIR_BUF address, not $1001!
+        ;
+        ; OK new plan: We have to use OPEN/CHROUT for full control.
+        jmp _dhs_manual_save
+        
+_dhs_manual_save:
+        ; Manual save using OPEN/CHROUT for full control
+        ; SETLFS for write: lfn=2, device, sa=1 (with header)
+        lda #$02
+        ldx p4_setlfs_dev
+        bne +
+        ldx #$08
++       ldy #$01                        ; SA=1 for PRG write
+        jsr SETLFS
+        
+        jsr OPEN
+        bcs _dhs_error
+        
+        ; CHKOUT to file 2
+        ldx #$02
+        jsr CHKOUT
+        bcs _dhs_close_error
+        
+        ; Write 2-byte header (load address)
+        lda p4_save_start_lo
+        jsr CHROUT
+        lda p4_save_start_hi
+        jsr CHROUT
+        
+        ; Write data bytes from P4_DIR_BUF
+        ; Use a pointer since length can be > 256
         lda #<P4_DIR_BUF
         sta $FB
         lda #>P4_DIR_BUF
         sta $FC
         
-        ; End address = P4_DIR_BUF + total_length
+        ; Calculate end address
         clc
         lda #<P4_DIR_BUF
-        adc _save_total_lo
-        tax
+        adc p4_dir_len_lo
+        sta $FD
         lda #>P4_DIR_BUF
-        adc _save_total_hi
-        tay
+        adc p4_dir_len_hi
+        sta $FE
         
-        ; A = ZP address of start pointer ($FB)
-        lda #$FB
-        jsr SAVE
-        bcc _dhs_ok
+_dhs_write_loop:
+        ; Check if we've reached end
+        lda $FC
+        cmp $FE
+        bcc _dhs_write_byte
+        bne _dhs_write_done
+        lda $FB
+        cmp $FD
+        bcs _dhs_write_done
+        
+_dhs_write_byte:
+        ldy #0
+        lda ($FB),y
+        jsr CHROUT
+        
+        ; Increment pointer
+        inc $FB
+        bne _dhs_write_loop
+        inc $FC
+        jmp _dhs_write_loop
+        
+_dhs_write_done:
+        ; Close file
+        jsr CLRCHN
+        lda #$02
+        jsr CLOSE
+        
+        ; Success
+        jmp _dhs_ok
+
+_dhs_close_error:
+        jsr CLRCHN
+        lda #$02
+        jsr CLOSE
+        jmp _dhs_error
         
         ; Save failed
         jsr P4HOOK_SaveSetError
@@ -805,7 +880,7 @@ P4HOOK_SaveSetError:
 ; ============================================================
 ; P4HOOK_DMACopyGuestToHost - Copy from guest RAM to staging buffer
 ; Source: Bank 5 at p4_save_start
-; Dest: P4_DIR_BUF+2 (after load address header)
+; Dest: P4_DIR_BUF (data only, header written separately)
 ; Length: p4_dir_len
 ; ============================================================
 P4HOOK_DMACopyGuestToHost:
@@ -830,9 +905,9 @@ _dma_g2h_src_lo:
         .byte $00
 _dma_g2h_src_hi:
         .byte $00
-        .byte BANK_RAM                  ; src bank 5 (guest RAM)
-        .byte <(P4_DIR_BUF+2)           ; dest lo
-        .byte >(P4_DIR_BUF+2)           ; dest hi
+        .byte P4_BANK_RAM               ; src bank 5 (guest RAM)
+        .byte <P4_DIR_BUF               ; dest lo
+        .byte >P4_DIR_BUF               ; dest hi
         .byte $00                       ; dest bank 0 (host RAM)
         .byte $00
         .word $0000

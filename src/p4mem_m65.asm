@@ -433,18 +433,22 @@ _write_not_ff3e:
         sta ted_regs,x
 
         ; Check for sound register writes
-        ; Note: BASIC writes frequency LOW byte last, so we only trigger
-        ; voice updates on the LOW byte write. The HIGH byte writes just
-        ; update ted_regs but don't trigger sound changes.
+        ; Plus/4 BASIC SOUND command has unusual register mapping:
+        ; SOUND 1: freq_lo -> $FF0E, freq_hi -> $FF12 (!)
+        ; SOUND 2/3: freq_lo -> $FF0F, freq_hi -> $FF10, control -> $FF11
+        ;
+        ; For SOUND 2/3, we ONLY trigger when $FF11 is written (last in sequence)
+        ; This ensures all frequency values are in place before playing
         cpx #$0E
         beq _ted_sound_v1_changed       ; Voice 1 freq low - triggers update
         cpx #$0F
-        beq _ted_write_done             ; Voice 1 freq high - just store, no update
+        beq _ted_write_done             ; Voice 2 freq low - just store, wait for $FF11
         cpx #$10
-        beq _ted_sound_v2_changed       ; Voice 2 freq low - triggers update
+        beq _ted_write_done             ; Voice 2 freq high - just store, wait for $FF11
         cpx #$11
-        beq _ted_sound_vol_changed      ; Volume + Voice 2 freq high + control
-
+        beq _ted_sound_vol_and_noise    ; Volume + control - triggers voice 2 update
+        cpx #$12
+        beq _ted_sound_v1_high          ; BASIC writes voice 1 freq HIGH here!
         ; Cursor position changes
         cpx #$0C
         beq _ted_cursor_changed
@@ -514,15 +518,36 @@ _ted_sound_v1_changed:
         jsr P4SND_UpdateVoice1
         rts
 
-_ted_sound_v2_changed:
-        jsr P4SND_UpdateVoice2
+_ted_sound_v1_high:
+        ; BASIC writes voice 1 freq HIGH bits to $FF12
+        ; We need to extract bits 0-1 and store them for voice 1
+        ; The value written is: (old_$FF12 & $FC) | freq_high_bits
+        ; So bits 0-1 contain the frequency high bits
+        lda ted_regs+$12
+        and #$03
+        sta p4snd_v1_freq_hi    ; Store in separate variable (not ted_regs!)
+        ; Now update voice 1 with the complete frequency
+        jsr P4SND_UpdateVoice1_WithHigh
         rts
 
-_ted_sound_vol_changed:
+_ted_sound_vol_and_noise:
+        ; $FF11 written - update volume
         jsr P4SND_UpdateVolume
-        ; Don't update voice 2 here - it will be updated when $FF10 is written
-        ; This prevents accidentally enabling voice 2 when only changing volume
+        ; Check if this is a SOUND 2/3 command
+        ; SOUND 2 sets bit 5 ($20), SOUND 3 sets bit 6 ($40)
+        ; SOUND 1 only sets bit 4 ($10)
+        ; So if bits 5 or 6 are set, this is SOUND 2/3
+        lda ted_regs+$11
+        and #$60                ; Check bits 5 and 6
+        beq _vol_done           ; If neither set, this is SOUND 1, skip voice 2 update
+        ; This is SOUND 2 or 3 - trigger voice 2 update
+        ; Now all registers ($FF0F, $FF10, $FF11) have been written
+        jsr P4SND_UpdateVoice2_FromBasic
+_vol_done:
         rts
+
+; Variable to store voice 1 freq high bits from $FF12 writes
+p4snd_v1_freq_hi: .byte 0
 
 ; ============================================================
 ; P4SND - TED to SID Sound Conversion
@@ -733,6 +758,7 @@ _snd_vol_store:
 
 ; ============================================================
 ; P4SND_UpdateVoice1 - Update SID voice 1 from TED registers
+; Uses ted_regs[$0E] for low byte and ted_regs[$0F] bits 0-1 for high
 ; ============================================================
 P4SND_UpdateVoice1:
         ; TED frequency value: $FF0E (low) + $FF0F bits 0-1 (high)
@@ -741,7 +767,21 @@ P4SND_UpdateVoice1:
         lda ted_regs+$0F        ; Voice 1 freq high (bits 0-1)
         and #$03
         sta p4snd_ted_freq_hi
-        
+        bra P4SND_V1_DoUpdate
+
+; ============================================================
+; P4SND_UpdateVoice1_WithHigh - Update voice 1 using stored high bits
+; Uses ted_regs[$0E] for low byte and p4snd_v1_freq_hi for high bits
+; This is called when BASIC writes freq high to $FF12
+; ============================================================
+P4SND_UpdateVoice1_WithHigh:
+        lda ted_regs+$0E        ; Voice 1 freq low
+        sta p4snd_ted_freq_lo
+        lda p4snd_v1_freq_hi    ; Use the separately stored high bits
+        sta p4snd_ted_freq_hi
+        ; Fall through to DoUpdate
+
+P4SND_V1_DoUpdate:
         ; Check if voice 1 is enabled
         ; Voice 1 should only play if the LOW byte ($FF0E) is non-zero
         ; The high bits alone (from $FF0F) are not enough to trigger sound
@@ -847,6 +887,86 @@ _v2_noise:
 _v2_off:
         ; Disable voice 2 and 3
         lda #$00                ; Gate off, no waveform
+        sta SID_BASE + SID_V2_CTRL
+        sta SID_BASE + SID_V3_CTRL
+        lda #0
+        sta p4snd_voice2_on
+        rts
+
+; ============================================================
+; P4SND_UpdateVoice2_FromBasic - Handle BASIC's weird frequency encoding
+; BASIC SOUND 2 writes: freq_lo to $FF0F, freq_hi to $FF10
+; This is backwards from the normal TED register layout!
+; ============================================================
+P4SND_UpdateVoice2_FromBasic:
+        ; BASIC encoding:
+        ; ted_regs[$0F] = frequency LOW byte (8 bits)
+        ; ted_regs[$10] = frequency HIGH bits (2 bits, in bits 0-1)
+        
+        lda ted_regs+$0F        ; Freq LOW from $FF0F
+        sta p4snd_ted_freq_lo
+        lda ted_regs+$10        ; Freq HIGH from $FF10 bits 0-1
+        and #$03
+        sta p4snd_ted_freq_hi
+        
+        ; Check noise mode (bit 6 of $FF11)
+        lda ted_regs+$11
+        and #$40
+        sta p4snd_noise_mode
+        
+        ; Check if voice 2 is enabled (freq low must be non-zero)
+        lda p4snd_ted_freq_lo
+        beq _v2b_off
+        
+        ; Convert TED frequency to SID frequency
+        jsr P4SND_ConvertFreq
+        
+        ; Check if noise or tone mode
+        lda p4snd_noise_mode
+        bne _v2b_noise
+        
+        ; Tone mode - use SID voice 2 with pulse wave
+        lda p4snd_sid_freq_lo
+        sta SID_BASE + SID_V2_FREQ_LO
+        lda p4snd_sid_freq_hi
+        sta SID_BASE + SID_V2_FREQ_HI
+        lda #$41                ; Pulse + gate
+        sta SID_BASE + SID_V2_CTRL
+        ; Turn off voice 3 (noise) completely
+        lda #$00
+        sta SID_BASE + SID_V3_CTRL
+        lda #1
+        sta p4snd_voice2_on
+        rts
+        
+_v2b_noise:
+        ; Noise mode - use SID voice 3 with noise waveform
+        ; TED noise has a different character than SID noise
+        ; Scale frequency down by 4 to get a lower rumble that matches TED better
+        lsr p4snd_sid_freq_hi
+        ror p4snd_sid_freq_lo
+        lsr p4snd_sid_freq_hi
+        ror p4snd_sid_freq_lo
+        lsr p4snd_sid_freq_hi
+        ror p4snd_sid_freq_lo
+        lsr p4snd_sid_freq_hi
+        ror p4snd_sid_freq_lo
+        
+        lda p4snd_sid_freq_lo
+        sta SID_BASE + SID_V3_FREQ_LO
+        lda p4snd_sid_freq_hi
+        sta SID_BASE + SID_V3_FREQ_HI
+        lda #$81                ; Noise + gate
+        sta SID_BASE + SID_V3_CTRL
+        lda #$00
+        sta SID_BASE + SID_V2_CTRL
+        lda #1
+        sta p4snd_voice2_on
+        rts
+        
+_v2b_off:
+        ; Disable voice 2 and 3
+        lda #$00
         sta SID_BASE + SID_V2_CTRL
         sta SID_BASE + SID_V3_CTRL
         lda #0
