@@ -26,7 +26,7 @@ BANK_ROM    = $04                       ; Plus/4 ROMs in bank 4
 BANK_RAM    = $05                       ; Plus/4 RAM in bank 5
 
 ; Memory buffer in bank 0 (host RAM) - only for low RAM now
-LOW_RAM_BUFFER  = $5000                 ; 4KB - Plus/4 low RAM $0000-$0FFF (always resident)
+LOW_RAM_BUFFER  = $A000                 ; 4KB - Plus/4 low RAM $0000-$0FFF (always resident)
 
 ; Common low-RAM offsets (computed from LOW_RAM_BUFFER)
 P4_SCREEN_BASE  = LOW_RAM_BUFFER + $0C00
@@ -54,6 +54,7 @@ p4_cur_div:       .byte 0     ; frame divider
 p4_video_mode:    .byte 0
 p4_gfx_dirty:     .byte 0
 p4_bmp_hi:        .byte $20   ; default $2000
+p4_screen_fill_pending: .byte 0  ; 1=need to fill screen RAM in frame handler
 
 ; Host VIC state save/restore (when flipping to bitmap)
 p4_host_bmp_on:   .byte 0
@@ -1097,9 +1098,18 @@ p4mem_write_check_fd:
         
         lda p4_addr_lo
         cmp #$30
-        bne _write_chk_fdd0
+        bne _write_chk_fd3f
         lda p4_data
         sta $DC00
+        rts
+
+_write_chk_fd3f:
+        cmp #$3F
+        bne _write_chk_fdd0
+        ; $FD3F = JIT runtime control
+        ; POKE 64831,0 = JIT off, POKE 64831,1 = JIT on
+        lda p4_data
+        sta jit_runtime_enabled
         rts
 
 _write_chk_fdd0:
@@ -1270,6 +1280,14 @@ P4VID_Frame:
         ; Check sound duration and turn off expired sounds
         jsr P4SND_FrameTick
         
+        ; Check if screen fill is pending (deferred from EnableHostBitmap)
+        lda p4_screen_fill_pending
+        beq _pf_no_fill
+        lda #0
+        sta p4_screen_fill_pending
+        jsr P4VID_DoScreenFill
+_pf_no_fill:
+        
         lda p4_video_mode
         beq _pf_done
         lda p4_gfx_dirty
@@ -1287,7 +1305,7 @@ _pf_done:
 P4VID_EnableHostBitmap:
         ; Check if we need to do initial setup
         lda p4_host_bmp_on
-        bne _update_mcm_only     ; Already in bitmap - just update MCM bit
+        bne _update_mcm_only
 
         ; === First time bitmap enable - full setup ===
         
@@ -1305,51 +1323,65 @@ P4VID_EnableHostBitmap:
         lda $D021
         sta p4_save_d021
 
-        ; Select VIC bank 1 ($4000-$7FFF)
+        ; Select VIC bank 3 ($C000-$FFFF) - avoids conflict with our code
+        ; DD00 bits 0-1: 00=bank 3, 01=bank 2, 10=bank 1, 11=bank 0
         lda $DD00
         and #$FC
-        ora #$02
+        ora #$00                ; Bank 3
         sta $DD00
 
-        ; Screen at $4800, Bitmap at $6000
-        lda #$28
+        ; Screen at $CC00, Bitmap at $E000 within bank 3
+        ; D018: bits 4-7 = screen offset/64, bit 3 = bitmap offset (0=$0000, 1=$2000)
+        ; Screen $CC00 in bank = $0C00 offset, /64 = $30 -> bits 4-7 = $3
+        ; Bitmap $E000 in bank = $2000 offset -> bit 3 = 1
+        ; D018 = $38
+        lda #$38
         sta $D018
 
         ; Enable bitmap mode in $D011
         lda $D011
-        ora #$20                ; Enable bitmap mode
+        ora #$20
         sta $D011
-        
+
         ; Mark bitmap as on
         lda #1
         sta p4_host_bmp_on
 
 _update_mcm_only:
         ; === Update multicolor bit (called every time) ===
-        ; This is the KEY fix - always update MCM when mode changes!
-        
         lda $D016
-        and #$EF                ; Clear MCM bit (bit 4), keep everything else
+        and #$EF                ; Clear MCM bit (bit 4)
         ldx p4_multicolor
         beq _mcm_cleared
         ora #$10                ; Set MCM bit if multicolor mode
 _mcm_cleared:
         sta $D016
 
-        ; === Setup colors based on mode ===
-        lda p4_multicolor
-        beq _setup_hires_colors
-        
-        ; Multicolor: Copy screen RAM and color RAM
-        jsr copy_mc_screen_ram
-        jsr copy_mc_color_ram
+        ; === Schedule deferred screen fill ===
+        ; Can't do it here (crashes), so do it in P4VID_Frame
+        lda #1
+        sta p4_screen_fill_pending
         rts
 
 _setup_hires_colors:
-        ; Hires mode: simple fill
+        ; Not used - screen fill is deferred to P4VID_Frame
+        rts
+
+_hires_fill_byte: .byte 0
+
+; ============================================================
+; P4VID_DoScreenFill - Fill screen RAM (called from P4VID_Frame)
+; This is deferred from EnableHostBitmap to avoid crashes
+; ============================================================
+P4VID_DoScreenFill:
+        ; Check if multicolor or hires
+        lda p4_multicolor
+        bne _dsf_multicolor
+        
+        ; === Hires mode: fill screen RAM at $CC00 with color ===
         lda $D021
         and #$0F
-        sta _scr_fill_color
+        sta _dsf_fill_byte
         
         lda P4_TCOLOR
         and #$7F
@@ -1360,24 +1392,29 @@ _setup_hires_colors:
         asl
         asl
         asl
-        ora _scr_fill_color
-        sta _scr_fill_color
-        sta _scr_fill_color+1
+        ora _dsf_fill_byte
+        sta _dsf_fill_byte
+        sta _dsf_fill_byte+1
 
-        ; Fill screen matrix
+        ; DMA fill screen RAM at $CC00 (1000 bytes)
         lda #$00
         sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $03
-        .word $03E8
-_scr_fill_color:
-        .word $1010
-        .byte $00
-        .word $4800
-        .byte $00
-        .byte $00
-        .word $0000
+        .byte $80, $00, $81, $00, $00   ; enhanced DMA options
+        .byte $03                       ; fill command
+        .word $03E8                     ; count (1000 bytes)
+_dsf_fill_byte:
+        .word $1010                     ; fill value (patched above)
+        .byte $00                       ; source bank (unused for fill)
+        .word $CC00                     ; dest address - screen RAM in bank 3
+        .byte $00                       ; dest bank 0
+        .byte $00                       ; sub-command
+        .word $0000                     ; modulo
+        rts
 
+_dsf_multicolor:
+        ; Multicolor mode: copy screen RAM and color RAM
+        jsr copy_mc_screen_ram
+        jsr copy_mc_color_ram
         rts
 
 ; ============================================================
@@ -1386,8 +1423,17 @@ _scr_fill_color:
 P4VID_DisableHostBitmap:
         lda p4_host_bmp_on
         beq _dis_done
+        
+        ; Restore DD00 (preserve IEC bits)
+        lda $DD00
+        and #$FC                ; Keep current IEC state (bits 2-7)
+        sta _dis_temp
         lda p4_save_dd00
+        and #$03                ; Get saved VIC bank bits only
+        ora _dis_temp
         sta $DD00
+        
+        ; Restore VIC state
         lda p4_save_d018
         sta $D018
         lda p4_save_d016
@@ -1403,7 +1449,9 @@ P4VID_DisableHostBitmap:
 _dis_done:
         rts
 
-; ============================================================
+_dis_temp: .byte 0
+
+
 ; P4VID_RenderHiresBitmap - DMA copy from bank 5 to host bitmap
 ; ============================================================
 P4VID_RenderHiresBitmap:
@@ -1417,7 +1465,7 @@ P4VID_RenderHiresBitmap:
         .word $1F40                     ; 8000 bytes
 _bm_src:
         .byte $00, $20, BANK_RAM        ; src lo/hi/bank (hi patched)
-        .byte $00, $60, $00             ; dst lo/hi/bank 0
+        .byte $00, $E0, $00             ; dst lo/hi/bank 0 - bitmap at $E000
         .byte $00
         .word $0000
         rts
@@ -1439,19 +1487,25 @@ copy_mc_screen_ram:
         sta _mc_scr_fill
         sta _mc_scr_fill+1
         
+        ; Use standard DMA trigger (not inline)
         lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $03
-        .word $03E8
-_mc_scr_fill:
-        .word $0000
-        .byte $00
-        .word $4800
-        .byte $00
-        .byte $00
-        .word $0000
+        sta $D702               ; DMA list in bank 0
+        lda #>_mc_scr_dmalist
+        sta $D701               ; DMA list MSB
+        lda #<_mc_scr_dmalist
+        sta $D700               ; DMA list LSB - triggers DMA
         rts
+
+_mc_scr_dmalist:
+        .byte $03                       ; fill command
+        .word $03E8                     ; count (1000 bytes)
+_mc_scr_fill:
+        .word $0000                     ; fill value (patched above)
+        .byte $00                       ; source bank (unused for fill)
+        .word $CC00                     ; Screen RAM at $CC00 in bank 3
+        .byte $00                       ; dest bank 0
+        .byte $00                       ; sub-command (F018B)
+        .word $0000                     ; modulo
 
 _mc_scr_tmp: .byte 0
 
@@ -1464,21 +1518,28 @@ copy_mc_color_ram:
         tax
         lda ted_to_c64_color,x
         and #$0F
+        sta _mc_col_fill
+        sta _mc_col_fill+1
         
-        ldx #0
-_fill:
-        sta $D800,x
-        sta $D900,x
-        sta $DA00,x
-        inx
-        bne _fill
-        ldx #0
-_fill2:
-        sta $DB00,x
-        inx
-        cpx #$E8
-        bne _fill2
+        ; Use standard DMA trigger (not inline)
+        lda #$00
+        sta $D702               ; DMA list in bank 0
+        lda #>_mc_col_dmalist
+        sta $D701               ; DMA list MSB
+        lda #<_mc_col_dmalist
+        sta $D700               ; DMA list LSB - triggers DMA
         rts
+
+_mc_col_dmalist:
+        .byte $03                       ; fill command
+        .word $03E8                     ; count (1000 bytes)
+_mc_col_fill:
+        .word $0000                     ; fill value (patched above)
+        .byte $00                       ; source bank (unused for fill)
+        .word $D800                     ; dest address - color RAM
+        .byte $80                       ; dest bank 0 with I/O enabled (bit 7)
+        .byte $00                       ; sub-command (F018B)
+        .word $0000                     ; modulo
 
 ; Split screen mode not implemented - GRAPHIC 2 acts like GRAPHIC 1
 
