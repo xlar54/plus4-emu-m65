@@ -56,6 +56,11 @@ p4_gfx_dirty:     .byte 0
 p4_bmp_hi:        .byte $20   ; default $2000
 p4_screen_fill_pending: .byte 0  ; 1=need to fill screen RAM in frame handler
 
+; --- Character set tracking ---
+p4_charset_dirty: .byte 0     ; 1=need to sync charset to MEGA65
+p4_charset_ram:   .byte 0     ; 0=using ROM charset, 1=using RAM charset
+p4_charset_base:  .byte 0     ; Character set base address high byte (from $FF13)
+
 ; Host VIC state save/restore (when flipping to bitmap)
 p4_host_bmp_on:   .byte 0
 p4_save_dd00:     .byte 0
@@ -76,6 +81,17 @@ P4MEM_Init:
         sta p4_rom_visible
         lda #0
         sta p4_rom_bank
+        
+        ; Initialize charset state
+        lda #0
+        sta p4_charset_ram
+        sta p4_charset_dirty
+        
+        ; Set up MEGA65 screen for text mode
+        ; Screen at $0800, charset at $1000 (ROM)
+        ; D018 = $24
+        lda #$24
+        sta $D018
         
         ; Clear TED registers
         ldx #31
@@ -443,37 +459,58 @@ _write_not_ff3e:
         cpx #$0E
         beq _ted_sound_v1_changed       ; Voice 1 freq low - triggers update
         cpx #$0F
-        beq _ted_write_done             ; Voice 2 freq low - just store, wait for $FF11
+        beq _ted_check_video            ; Voice 2 freq low - just store
         cpx #$10
-        beq _ted_write_done             ; Voice 2 freq high - just store, wait for $FF11
+        beq _ted_check_video            ; Voice 2 freq high - just store
         cpx #$11
         beq _ted_sound_vol_and_noise    ; Volume + control - triggers voice 2 update
         cpx #$12
-        beq _ted_sound_v1_high          ; BASIC writes voice 1 freq HIGH here!
+        beq _ted_reg12_write            ; $FF12 - sound AND video AND charset!
+        cpx #$13
+        beq _ted_reg13_write            ; $FF13 - charset base address
         ; Cursor position changes
         cpx #$0C
         beq _ted_cursor_changed
         cpx #$0D
-        bne _ted_write_done
+        beq _ted_cursor_changed
+        bra _ted_check_video
+
 _ted_cursor_changed:
         phx
         jsr P4VID_UpdateCursor
         plx
-_ted_write_done:
+        bra _ted_check_video
 
-        ; Video mode / bitmap base changes
-         cpx #$06
-         beq _ted_vidchg
-         cpx #$07               ; <-- ADD THIS: MCM bit is in $FF07
-         beq _ted_vidchg        ; <-- ADD THIS
-         cpx #$12
-         beq _ted_vidchg
-         cpx #$14
-         bne _ted_viddone
- _ted_vidchg:
+_ted_reg12_write:
+        ; $FF12 handles: sound voice 1 high bits, video mode, AND charset
+        ; First do sound
+        lda ted_regs+$12
+        and #$03
+        sta p4snd_v1_freq_hi
+        jsr P4SND_UpdateVoice1_WithHigh
+        ; Then check video mode
         jsr P4VID_GfxConfigChanged
- _ted_viddone:
-        
+        ; Then check charset
+        jsr P4VID_CharsetChanged
+        rts
+
+_ted_reg13_write:
+        ; $FF13 is charset base address
+        jsr P4VID_CharsetChanged
+        rts
+
+_ted_check_video:
+        ; Video mode / bitmap base changes
+        cpx #$06
+        beq _ted_vidchg
+        cpx #$07
+        beq _ted_vidchg
+        cpx #$14
+        bne _ted_check_other
+_ted_vidchg:
+        jsr P4VID_GfxConfigChanged
+
+_ted_check_other:
         cpx #$01
         beq _write_ff01
         cpx #$09
@@ -517,18 +554,6 @@ _write_ff19:
 ; Jump targets for sound register changes
 _ted_sound_v1_changed:
         jsr P4SND_UpdateVoice1
-        rts
-
-_ted_sound_v1_high:
-        ; BASIC writes voice 1 freq HIGH bits to $FF12
-        ; We need to extract bits 0-1 and store them for voice 1
-        ; The value written is: (old_$FF12 & $FC) | freq_high_bits
-        ; So bits 0-1 contain the frequency high bits
-        lda ted_regs+$12
-        and #$03
-        sta p4snd_v1_freq_hi    ; Store in separate variable (not ted_regs!)
-        ; Now update voice 1 with the complete frequency
-        jsr P4SND_UpdateVoice1_WithHigh
         rts
 
 _ted_sound_vol_and_noise:
@@ -1265,11 +1290,110 @@ _gfx_to_text:
         rts
 
 ; ============================================================
+; P4VID_CharsetChanged - Called when $FF12 or $FF13 is written
+; Detects if Plus/4 is using ROM or RAM character set
+; ============================================================
+P4VID_CharsetChanged:
+        ; Check $FF12 bit 2: 0=RAM, 1=ROM
+        lda ted_regs+$12
+        and #$04
+        bne _charset_rom
+        
+        ; Using RAM character set
+        lda #1
+        sta p4_charset_ram
+        
+        ; Get base address from $FF13 bits 2-7
+        ; Address = ($FF13 & $FC) * 256 (gives 1K aligned address)
+        lda ted_regs+$13
+        and #$FC
+        sta p4_charset_base
+        
+        ; Mark charset as needing sync
+        lda #1
+        sta p4_charset_dirty
+        rts
+
+_charset_rom:
+        ; Using ROM character set
+        lda p4_charset_ram      ; Was it previously RAM?
+        beq _charset_already_rom
+        
+        ; Switching back to ROM - need to restore MEGA65 charset pointer
+        lda #0
+        sta p4_charset_ram
+        lda #1
+        sta p4_charset_dirty
+        
+_charset_already_rom:
+        rts
+
+; ============================================================
+; P4VID_SyncCharset - Copy Plus/4 charset from RAM to MEGA65
+; Called from P4VID_Frame when p4_charset_dirty is set
+; Only syncs when in text mode (not bitmap mode)
+; ============================================================
+P4VID_SyncCharset:
+        ; Only sync charset in text mode
+        lda p4_video_mode
+        bne _sync_charset_done  ; In bitmap mode, skip
+        
+        ; Also skip if host bitmap is on (transitioning)
+        lda p4_host_bmp_on
+        bne _sync_charset_done
+        
+        lda p4_charset_ram
+        bne _sync_ram_charset
+        
+        ; ROM charset - point VIC-IV back to default C64 charset
+        ; Default C64 charset is at $2D000 in MEGA65 address space
+        ; Use CHARPTR registers $D068-$D06A
+        lda #$00
+        sta $D068               ; CHARPTR LSB
+        lda #$D0
+        sta $D069               ; CHARPTR MSB  
+        lda #$02
+        sta $D06A               ; CHARPTR bank (bank 2 = $2xxxx)
+        
+        ; Re-enable hot registers
+        lda #$80
+        tsb $D05D               ; Set bit 7 (HOTREG)
+        rts
+        
+_sync_ram_charset:
+        ; RAM charset - point VIC-IV directly to Plus/4 RAM in bank 5
+        ; Charset is at p4_charset_base * 256 in Plus/4 address space
+        ; Plus/4 RAM is in bank 5, so address is $05xx00
+        
+        ; Disable hot registers so D018 writes don't override our CHARPTR
+        lda #$80
+        trb $D05D               ; Clear bit 7 (HOTREG)
+        
+        ; Set CHARPTR to bank 5 + charset base
+        lda #$00
+        sta $D068               ; CHARPTR LSB = 0
+        lda p4_charset_base
+        sta $D069               ; CHARPTR MSB = charset base high byte
+        lda #BANK_RAM           ; Bank 5
+        sta $D06A               ; CHARPTR bank
+        
+_sync_charset_done:
+        rts
+
+; ============================================================
 ; P4VID_Frame - Called once per frame
 ; ============================================================
 P4VID_Frame:
         ; Check sound duration and turn off expired sounds
         jsr P4SND_FrameTick
+        
+        ; Check if charset sync is pending
+        lda p4_charset_dirty
+        beq _pf_no_charset
+        lda #0
+        sta p4_charset_dirty
+        jsr P4VID_SyncCharset
+_pf_no_charset:
         
         ; Check if screen fill is pending (deferred from EnableHostBitmap)
         lda p4_screen_fill_pending
