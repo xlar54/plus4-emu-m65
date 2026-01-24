@@ -244,6 +244,9 @@ _wait:
         ; ----------------------------------------------------
         ; Reset Plus/4 CPU and start emulation
         ; ----------------------------------------------------
+        ; Initialize VIC-IV video settings NOW (after all KERNAL calls)
+        jsr P4MEM_InitVideo
+        
         jsr P4CPU_Reset
         
 main_loop:

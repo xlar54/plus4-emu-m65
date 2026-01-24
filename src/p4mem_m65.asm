@@ -76,7 +76,8 @@ p4_multicolor:    .byte 0     ; 0=hires, 1=multicolor
 ; P4MEM_Init - Initialize memory system
 ; ============================================================
 P4MEM_Init:
-        ; Initialize state
+        ; Initialize state variables only
+        ; Video setup is done separately by P4MEM_InitVideo (after KERNAL calls)
         lda #1
         sta p4_rom_visible
         lda #0
@@ -86,12 +87,6 @@ P4MEM_Init:
         lda #0
         sta p4_charset_ram
         sta p4_charset_dirty
-        
-        ; Set up MEGA65 screen for text mode
-        ; Screen at $0800, charset at $1000 (ROM)
-        ; D018 = $24
-        lda #$24
-        sta $D018
         
         ; Clear TED registers
         ldx #31
@@ -124,6 +119,72 @@ _clear_ted:
         ; Clear local low RAM buffer
         jsr clear_low_ram_buffer
 
+        rts
+
+; ============================================================
+; P4MEM_InitVideo - Set up VIC-IV for Plus/4 display
+; Call this AFTER all MEGA65 KERNAL calls are done!
+; ============================================================
+P4MEM_InitVideo:
+        ; Enable VIC-III/VIC-IV mode to access registers
+        ; First unlock VIC-III: write $A5 then $96 to $D02F
+        lda #$A5
+        sta $D02F
+        lda #$96
+        sta $D02F
+        ; Then unlock VIC-IV: write $47 then $53 to $D02F
+        lda #$47
+        sta $D02F
+        lda #$53
+        sta $D02F
+        
+        ; Initialize the TED 128-color palette for border/background
+        jsr P4VID_InitPalette
+        
+        ; ============================================================
+        ; Point VIC-IV screen at LOW_RAM_BUFFER + $0C00
+        ; Plus/4 low RAM ($0000-$0FFF) is mirrored to LOW_RAM_BUFFER ($A000)
+        ; So screen at Plus/4 $0C00 is at host $AC00 (bank 0)
+        ; ============================================================
+        lda #$00
+        sta $D060               ; SCRNPTR LSB = $00
+        lda #$AC
+        sta $D061               ; SCRNPTR middle = $AC (for $AC00)
+        lda #$00
+        sta $D062               ; SCRNPTR bank = 0
+        
+        ; Point charset at default location initially
+        ; $2D000 is the C64 charset in MEGA65
+        lda #$00
+        sta $D068               ; CHARPTR LSB
+        lda #$D0
+        sta $D069               ; CHARPTR middle  
+        lda #$02
+        sta $D06A               ; CHARPTR bank
+        
+        ; Color RAM pointer - use offset 0 (start of color RAM at $D800)
+        lda #$00
+        sta $D064               ; COLPTR LSB
+        lda #$00  
+        sta $D065               ; COLPTR MSB
+        
+        ; Standard 40-column text mode
+        ; Virtual row width = 40 bytes (standard)
+        lda #40
+        sta $D058
+        lda #0
+        sta $D059
+        
+        ; Make sure CHR16 is OFF (standard 1-byte screen codes)
+        lda $D054
+        and #$FE                ; Clear CHR16 bit
+        sta $D054
+        
+        ; Disable MCM for now (no multicolor text)
+        lda $D016
+        and #$EF                ; Clear MCM bit
+        sta $D016
+        
         rts
 
 ; ============================================================
@@ -395,26 +456,22 @@ _mirror_check:
         rts                             ; $00-$07: no mirror needed
 
 _do_screen_mirror:
-        ; Screen mirror: Plus/4 $0C00-$0FFF -> MEGA65 $0800-$0BFF
-        sec
-        sbc #$04                        ; $0C->$08, $0D->$09, etc.
-        sta _scr_mir+2
-        ldx p4_addr_lo
-        lda p4_data
-_scr_mir:
-        sta $0800,x
+        ; Screen mirror NO LONGER NEEDED!
+        ; VIC-IV SCRNPTR points directly to Plus/4 RAM at $050C00
+        ; Plus/4 writes to $0C00-$0FFF go to bank 5 which VIC-IV reads
         rts
 
 _do_color_mirror:
         ; Color RAM mirror: Plus/4 $0800-$0BFF -> MEGA65 $D800-$DBFF
+        ; Map TED 128 colors to C64 16 colors using lookup table
         clc
         adc #$D0                        ; $08->$D8, $09->$D9, etc.
         sta _col_mir+2
         ldx p4_addr_lo
         lda p4_data
-        and #$7F
+        and #$7F                        ; TED color is 7 bits
         tay
-        lda ted_to_c64_color,y
+        lda ted_to_c64_color,y          ; Map to 16 C64 colors
 _col_mir:
         sta $D800,x
         rts
@@ -536,19 +593,22 @@ _write_ff09:
         rts
 
 _write_ff15:
+        ; Background color - store in ted_regs AND apply to VIC-IV
+        ; In text mode, use TED color directly (128-color palette)
+        ; Value is also stored for bitmap mode to map later
         lda p4_data
-        and #$7F
-        tax
-        lda ted_to_c64_color,x
-        sta $D021
+        sta ted_regs+$15        ; Store in TED register shadow
+        and #$7F                ; TED color is 7 bits (0-127)
+        sta $D021               ; VIC-IV uses our custom 128-color palette
         rts
 
 _write_ff19:
+        ; Border color - store in ted_regs AND apply to VIC-IV
+        ; In text mode, use TED color directly (128-color palette)
         lda p4_data
-        and #$7F
-        tax
-        lda ted_to_c64_color,x
-        sta $D020
+        sta ted_regs+$19        ; Store in TED register shadow
+        and #$7F                ; TED color is 7 bits (0-127)
+        sta $D020               ; VIC-IV uses our custom 128-color palette
         rts
 
 ; Jump targets for sound register changes
@@ -1177,19 +1237,14 @@ P4VID_UpdateCursor:
         clc
         adc #>P4_SCREEN_BASE
         sta _scr_restore+2
-
-        lda p4_cur_prev_hi
-        and #$03
-        clc
-        adc #$08
-        sta _host_restore+2
+        sta _host_restore+2     ; Same location - P4_SCREEN_BASE
 
         ldx p4_cur_prev_lo
 _scr_restore:
         lda P4_SCREEN_BASE,x
         and #$7F
 _host_restore:
-        sta $0800,x
+        sta P4_SCREEN_BASE,x    ; Write back to screen buffer
 
 _no_restore:
         ; --- load new cursor pos from TED regs ---
@@ -1204,12 +1259,7 @@ _no_restore:
         clc
         adc #>P4_SCREEN_BASE
         sta _scr_set+2
-
-        lda p4_cur_prev_hi
-        and #$03
-        clc
-        adc #$08
-        sta _host_set+2
+        sta _host_set+2         ; Same location - P4_SCREEN_BASE
 
         ldx p4_cur_prev_lo
 _scr_set:
@@ -1220,7 +1270,7 @@ _scr_set:
         ora #$80
 _write_cursor:
 _host_set:
-        sta $0800,x
+        sta P4_SCREEN_BASE,x    ; Write to screen buffer
         rts
 
 ; ============================================================
@@ -1387,6 +1437,19 @@ P4VID_Frame:
         ; Check sound duration and turn off expired sounds
         jsr P4SND_FrameTick
         
+        ; Update cursor blink (only in text mode)
+        lda p4_video_mode
+        bne _pf_skip_cursor
+        inc p4_cur_div
+        lda p4_cur_div
+        and #$0F                ; Toggle every 16 frames
+        bne _pf_skip_cursor
+        lda p4_cur_phase
+        eor #1
+        sta p4_cur_phase
+        jsr P4VID_UpdateCursor
+_pf_skip_cursor:
+        
         ; Check if charset sync is pending
         lda p4_charset_dirty
         beq _pf_no_charset
@@ -1462,6 +1525,12 @@ P4VID_EnableHostBitmap:
         lda #1
         sta p4_host_bmp_on
 
+        ; In VIC-II bitmap mode we only get 16 color indices.
+        ; Force palette entries 0..15 to the *brightest* TED hues so
+        ; bitmap colors resemble TED (brightness 7) instead of the
+        ; very-dark luminance-0 entries.
+        jsr P4VID_SetBrightTEDPalette16
+
 _update_mcm_only:
         ; === Update multicolor bit (called every time) ===
         lda $D016
@@ -1471,6 +1540,21 @@ _update_mcm_only:
         ora #$10                ; Set MCM bit if multicolor mode
 _mcm_cleared:
         sta $D016
+
+        ; === Set border/background from TED colors ===
+        ; In bitmap mode, VIC-II $D020/$D021 only use 4 bits (0-15)
+        ; So we must map TED 128 colors to C64 16 colors
+        lda ted_regs+$19        ; TED border color
+        and #$7F
+        tax
+        lda ted_to_c64_color,x  ; Map to C64 color (0-15)
+        sta $D020
+        
+        lda ted_regs+$15        ; TED background color
+        and #$7F
+        tax
+        lda ted_to_c64_color,x  ; Map to C64 color (0-15)
+        sta $D021
 
         ; === Schedule deferred screen fill ===
         ; Can't do it here (crashes), so do it in P4VID_Frame
@@ -1555,12 +1639,31 @@ P4VID_DisableHostBitmap:
         sta $D016
         lda p4_save_d011
         sta $D011
-        lda p4_save_d020
+        
+        ; Restore border/background from TED registers (use 128-color palette)
+        ; Don't use saved values - those were C64-mapped for bitmap mode
+        lda ted_regs+$19
+        and #$7F
         sta $D020
-        lda p4_save_d021
+        lda ted_regs+$15
+        and #$7F
         sta $D021
+        
+        ; Restore VIC-IV SCRNPTR to text screen location
+        ; Screen is at LOW_RAM_BUFFER + $0C00 = $AC00 in bank 0
+        lda #$00
+        sta $D060               ; SCRNPTR LSB = $00
+        lda #$AC
+        sta $D061               ; SCRNPTR middle = $AC
+        lda #$00
+        sta $D062               ; SCRNPTR bank = 0
+        
         lda #0
         sta p4_host_bmp_on
+
+        ; Restore full 128-entry TED palette for text mode
+        ; (also restores entries 0..15 back to the standard TED table).
+        jsr P4VID_InitPalette
 _dis_done:
         rts
 
@@ -1661,35 +1764,151 @@ _mc_col_fill:
 ; ============================================================
 ; TED to C64 color mapping table (128 entries)
 ; ============================================================
-ted_to_c64_color:
+; ============================================================
+; P4VID_InitPalette - Initialize VIC-IV palette with TED colors
+; TED color format: bits 6-4 = luminance (0-7), bits 3-0 = hue (0-15)
+; Palette entries 0-127 are set to TED colors
+; ============================================================
+P4VID_InitPalette:
+        ; Loop through all 128 TED colors
+        ldx #0
+        
+_pal_loop:
+        ; X = TED color value (0-127)
+        ; Look up RGB values from our pre-calculated table
+        lda ted_palette_r,x
+        sta $D100,x             ; Red palette
+        lda ted_palette_g,x
+        sta $D200,x             ; Green palette
+        lda ted_palette_b,x
+        sta $D300,x             ; Blue palette
+        
+        inx
+        cpx #128
+        bne _pal_loop
+        rts
+
+; ============================================================
+; P4VID_SetBrightTEDPalette16
+; Overwrite VIC palette entries 0..15 with the *brightest* TED hues.
+;
+; Why this exists:
+;   - In VIC-II bitmap modes, color indices are only 0..15.
+;   - Our normal TED palette maps 0..127 to TED colors, so entries 0..15
+;     are luminance-0 (mostly very dark).
+;   - When we present TED graphics through VIC-II bitmap, we want indices
+;     0..15 to correspond to TED hues at luminance 7 (indices $70..$7F).
+; ============================================================
+P4VID_SetBrightTEDPalette16:
+        ldx #0
+_btp_loop:
+        lda ted_palette_r+$70,x
+        sta $D100,x
+        lda ted_palette_g+$70,x
+        sta $D200,x
+        lda ted_palette_b+$70,x
+        sta $D300,x
+        inx
+        cpx #16
+        bne _btp_loop
+        rts
+
+; ============================================================
+; TED Palette RGB values (4-bit per channel, 0-15)
+; Index = (luminance * 16) + hue
+; Based on standard TED color calculations
+; ============================================================
+
+; Hue definitions:
+;  0 = Black (no hue, just luminance)
+;  1 = White (no hue, just luminance) 
+;  2 = Red
+;  3 = Cyan
+;  4 = Purple
+;  5 = Green
+;  6 = Blue
+;  7 = Yellow
+;  8 = Orange
+;  9 = Brown
+; 10 = Yellow-Green
+; 11 = Pink
+; 12 = Blue-Green
+; 13 = Light Blue
+; 14 = Dark Blue (purple-ish)
+; 15 = Light Green
+
+ted_palette_r:
         ; Luminance 0 (darkest)
-        .byte $00, $0B, $02, $03, $04, $05, $06, $07
-        .byte $08, $09, $05, $0A, $0B, $0E, $06, $0D
-        
+        .byte $0, $2, $5, $0, $5, $0, $0, $2, $5, $2, $2, $5, $0, $0, $2, $0
         ; Luminance 1
-        .byte $00, $0B, $02, $03, $04, $05, $06, $07
-        .byte $08, $09, $05, $0A, $0B, $0E, $06, $0D
-        
+        .byte $0, $4, $7, $0, $7, $0, $0, $4, $7, $4, $4, $7, $0, $0, $4, $0
         ; Luminance 2
-        .byte $00, $0C, $02, $03, $04, $05, $06, $07
-        .byte $08, $09, $05, $0A, $0B, $0E, $06, $0D
-        
+        .byte $0, $6, $9, $2, $9, $2, $2, $6, $9, $6, $6, $9, $2, $0, $6, $2
         ; Luminance 3
-        .byte $00, $0C, $02, $03, $04, $05, $06, $07
-        .byte $08, $09, $0D, $0A, $03, $0E, $06, $0D
-        
+        .byte $0, $8, $B, $4, $B, $4, $4, $8, $B, $8, $6, $B, $4, $3, $8, $4
         ; Luminance 4
-        .byte $0B, $0F, $0A, $03, $04, $0D, $0E, $07
-        .byte $08, $09, $0D, $0A, $03, $0E, $0E, $0D
-        
+        .byte $0, $9, $D, $6, $D, $6, $6, $9, $D, $9, $8, $D, $6, $6, $9, $6
         ; Luminance 5
-        .byte $0B, $0F, $0A, $03, $0A, $0D, $0E, $07
-        .byte $08, $09, $0D, $07, $03, $0E, $0E, $0D
-        
+        .byte $0, $B, $F, $8, $F, $8, $8, $B, $F, $B, $9, $F, $8, $8, $B, $8
         ; Luminance 6
-        .byte $0C, $0F, $0A, $03, $0A, $0D, $0E, $07
-        .byte $07, $07, $07, $07, $03, $07, $0E, $0D
-        
+        .byte $0, $D, $F, $A, $F, $A, $A, $D, $F, $D, $B, $F, $A, $A, $D, $A
         ; Luminance 7 (brightest)
-        .byte $01, $01, $0A, $03, $0A, $0D, $0E, $07
-        .byte $07, $07, $07, $07, $03, $07, $07, $01
+        .byte $0, $F, $F, $C, $F, $C, $C, $F, $F, $F, $D, $F, $C, $C, $F, $C
+
+ted_palette_g:
+        ; Luminance 0 (darkest)
+        .byte $0, $2, $0, $5, $0, $5, $0, $5, $2, $0, $5, $0, $5, $2, $0, $5
+        ; Luminance 1
+        .byte $0, $4, $0, $7, $0, $7, $0, $7, $4, $0, $7, $0, $7, $4, $0, $7
+        ; Luminance 2
+        .byte $0, $6, $0, $9, $0, $9, $0, $9, $6, $2, $9, $2, $9, $6, $2, $9
+        ; Luminance 3
+        .byte $0, $8, $0, $B, $0, $B, $2, $B, $8, $4, $B, $4, $B, $8, $4, $B
+        ; Luminance 4
+        .byte $0, $9, $0, $D, $0, $D, $4, $D, $9, $6, $D, $6, $D, $9, $6, $D
+        ; Luminance 5
+        .byte $0, $B, $0, $F, $0, $F, $6, $F, $B, $8, $F, $8, $F, $B, $8, $F
+        ; Luminance 6
+        .byte $0, $D, $2, $F, $2, $F, $8, $F, $D, $A, $F, $A, $F, $D, $A, $F
+        ; Luminance 7 (brightest)
+        .byte $0, $F, $4, $F, $4, $F, $A, $F, $F, $C, $F, $C, $F, $F, $C, $F
+
+ted_palette_b:
+        ; Luminance 0 (darkest)
+        .byte $0, $2, $0, $5, $5, $0, $5, $0, $0, $0, $0, $5, $5, $5, $5, $0
+        ; Luminance 1
+        .byte $0, $4, $0, $7, $7, $0, $7, $0, $0, $0, $0, $7, $7, $7, $7, $0
+        ; Luminance 2
+        .byte $0, $6, $0, $9, $9, $0, $9, $0, $0, $0, $0, $9, $9, $9, $9, $0
+        ; Luminance 3
+        .byte $0, $8, $0, $B, $B, $0, $B, $0, $0, $0, $0, $B, $B, $B, $B, $0
+        ; Luminance 4
+        .byte $0, $9, $0, $D, $D, $0, $D, $0, $0, $0, $0, $D, $D, $D, $D, $0
+        ; Luminance 5
+        .byte $0, $B, $0, $F, $F, $0, $F, $0, $0, $0, $0, $F, $F, $F, $F, $0
+        ; Luminance 6
+        .byte $0, $D, $2, $F, $F, $2, $F, $2, $2, $0, $2, $F, $F, $F, $F, $2
+        ; Luminance 7 (brightest)
+        .byte $0, $F, $4, $F, $F, $4, $F, $4, $4, $2, $4, $F, $F, $F, $F, $4
+
+; ============================================================
+; TED to C64 color mapping (for text mode color RAM)
+; Used when we need to map TED colors to the 16 C64 colors
+; ============================================================
+ted_to_c64_color:
+        ; Bitmap-mode mapping:
+        ;   The VIC-II bitmap pipeline can only emit color indices 0..15.
+        ;   For the Plus/4 we choose to preserve *hue* and drop luminance,
+        ;   then program palette entries 0..15 to TED luminance 7.
+        ;
+        ; Result: TED $00..$7F -> (TED & $0F)
+        ;         (i.e., 0..15 repeated for all 8 luminance levels)
+        .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
+        .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
+        .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
+        .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
+        .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
+        .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
+        .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
+        .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
+        
