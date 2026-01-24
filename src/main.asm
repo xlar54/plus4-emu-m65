@@ -220,11 +220,6 @@ _init_done:
 
         jsr P4MEM_Init
 
-.if JIT_ENABLED
-        ; Initialize JIT decode cache
-        jsr JIT_InitCache
-.endif
-
         ldx #0
 _ready_msg:
         lda ready_msg,x
@@ -451,4 +446,3 @@ fail_msg:
         .include "p4hooks.asm"
         .include "p4mem_m65.asm"
         .include "p4host.asm"
-        .include "p4jit.asm"

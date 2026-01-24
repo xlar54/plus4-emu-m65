@@ -126,17 +126,26 @@ p4_save_end_hi:   .byte 0
 ;   Called once per emulated instruction, right before opcode fetch.
 ; ------------------------------------------------------------
 P4HOOK_CheckAndRun:
-        pha
-        txa
-        pha
-        tya
-        pha
-
+        ; Quick check - most instructions are not at hook addresses
+        ; Only save registers if we might actually run a hook
         lda p4_pc_hi
 
         ; ----- Check for $FFxx addresses (SETNAM, SETLFS, SAVE) -----
         cmp #$FF
-        bne _not_ff
+        beq _check_ff_hooks
+        
+        ; ----- Check for $C8xx (DIRECTORY at $C8BC) -----
+        cmp #$C8
+        beq _check_c8_hooks
+        
+        ; ----- Check for LOAD hook at $A800 -----
+        cmp #$A8
+        beq _check_a8_hooks
+        
+        ; No hook - fast return without saving registers
+        rts
+
+_check_ff_hooks:
         lda p4_pc_lo
         cmp #$BD                        ; SETNAM = $FFBD
         beq _do_setnam
@@ -144,47 +153,68 @@ P4HOOK_CheckAndRun:
         beq _do_setlfs
         cmp #$D8                        ; SAVE = $FFD8
         beq _do_save
-        jmp _check_other
+        rts
 
+_check_c8_hooks:
+        lda p4_pc_lo
+        cmp #$BC                        ; DIRECTORY = $C8BC
+        beq _do_directory
+        rts
+
+_check_a8_hooks:
+        lda p4_pc_lo
+        bne _done_no_restore
+        ; We're at $A800 - the JSR $FFD5 inside BASIC LOAD
+        jmp _do_load
+
+_done_no_restore:
+        rts
+
+; --- Actual hook handlers (save registers first) ---
 _do_setnam:
+        pha
+        txa
+        pha
+        tya
+        pha
         jsr P4HOOK_OnSETNAM
         jmp _done
 
 _do_setlfs:
+        pha
+        txa
+        pha
+        tya
+        pha
         jsr P4HOOK_OnSETLFS
         jmp _done
 
 _do_save:
+        pha
+        txa
+        pha
+        tya
+        pha
         jsr P4HOOK_OnSAVE
         jmp _done
 
-_not_ff:
-        ; ----- Check for $C8xx (DIRECTORY at $C8BC) -----
-        cmp #$C8
-        bne _check_a8
-        lda p4_pc_lo
-        cmp #$BC                        ; DIRECTORY = $C8BC
-        bne _done
+_do_directory:
+        pha
+        txa
+        pha
+        tya
+        pha
         jsr P4HOOK_OnDIRECTORY
         jmp _done
 
-_check_a8:
-        ; ----- Check for LOAD hook at $A800 -----
-        cmp #$A8
-        bne _done
-        lda p4_pc_lo
-        cmp #$00
-        bne _done
-
-_check_other:
-        lda p4_pc_hi
-        cmp #$A8
-        bne _done
-        lda p4_pc_lo
-        bne _done
-        
-        ; We're at $A800 - the JSR $FFD5 inside BASIC LOAD
+_do_load:
+        pha
+        txa
+        pha
+        tya
+        pha
         jsr P4HOOK_OnLOAD
+        jmp _done
 
 _done:
         pla

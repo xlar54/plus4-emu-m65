@@ -5,88 +5,6 @@
 
         .cpu "45gs02"
 
-; ============================================================
-; JIT Configuration
-; ============================================================
-JIT_ENABLED = 1                 ; Set to 1 to enable JIT, 0 to disable
-
-; Runtime JIT control - POKE 64831,1 to enable, POKE 64831,0 to disable
-; Address $FD3F in Plus/4 memory space
-jit_runtime_enabled: .byte 1    ; Default: JIT on (if compiled with JIT_ENABLED=1)
-
-; ============================================================
-; JIT_CheckCache - Check if current PC has cached decode
-; Must be placed here (low address) to work correctly
-; ============================================================
-.if JIT_ENABLED
-JIT_CheckCache:
-        ; Check runtime enable flag first
-        lda jit_runtime_enabled
-        beq _jit_disabled
-        
-
-        ; Only cache ROM addresses ($8000-$FFFF)
-        lda p4_pc_hi
-        cmp #$80
-        bcs _jit_is_rom
-
-_jit_disabled:
-        ; Not ROM or JIT disabled - return miss
-        clc
-        rts
-
-_jit_is_rom:
-        ; Calculate cache address: $8000000 + ((PC - $8000) << 1)
-        sec
-        lda p4_pc_lo
-        sbc #$00
-        sta jit_cache_addr
-        lda p4_pc_hi
-        sbc #$80
-        sta jit_cache_addr+1
-        
-        ; Shift left by 1 (multiply by 2)
-        asl jit_cache_addr
-        rol jit_cache_addr+1
-        
-        ; Set bank and megabyte for Attic RAM at $8000000
-        lda #$00
-        sta jit_cache_addr+2
-        lda #JIT_CACHE_MB_PTR
-        sta jit_cache_addr+3
-        
-        ; Read cache entry byte 0 (opcode + 1)
-        ldz #0
-        ; 32-bit lda [jit_cache_addr],z = $EA $B2 $1D
-        .byte $EA, $B2, jit_cache_addr
-        beq _jit_not_cached
-        
-        ; Cache hit - decode the opcode
-        sec
-        sbc #1
-        sta jit_handler_idx
-        
-        ; Read byte 1 (length in bits 6-7)
-        inz
-        ; 32-bit lda [jit_cache_addr],z = $EA $B2 $1D
-        .byte $EA, $B2, jit_cache_addr
-        lsr
-        lsr
-        lsr
-        lsr
-        lsr
-        lsr
-        sta jit_inst_length
-        
-        ; Return cache hit
-        sec
-        rts
-
-_jit_not_cached:
-        clc
-        rts
-.endif
-
 ; Zero-page CPU state
 p4_a        = $02
 p4_x        = $03
@@ -190,12 +108,6 @@ inc_pc:
         inw p4_pc_lo
         rts
 
-        ;inc p4_pc_lo
-        ;bne _incpc_done
-        ;inc p4_pc_hi
-_incpc_done:
-        rts
-
 ; --- fetch8: A = mem[PC], PC++ ---
 fetch8:
         lda p4_pc_lo
@@ -203,7 +115,7 @@ fetch8:
         lda p4_pc_hi
         sta p4_addr_hi
         jsr P4MEM_Read
-        jsr inc_pc
+        inw p4_pc_lo            ; Inlined inc_pc
         rts
 
 ; --- fetch16_to_addr ---
@@ -689,46 +601,8 @@ _step_execute:
         ; --------------------------------------------------------
         jsr P4HOOK_CheckAndRun
         
-.if JIT_ENABLED
         ; --------------------------------------------------------
-        ; JIT Cache: Try cache first for ROM addresses
-        ; --------------------------------------------------------
-        jsr JIT_CheckCache
-        bcc _jit_cache_miss
-        
-        ; Cache hit - advance PC past opcode byte
-        inc p4_pc_lo
-        bne +
-        inc p4_pc_hi
-+
-        ; Get handler and dispatch
-        jsr JIT_GetHandler
-        jmp (p4_vec_lo)
-
-_jit_cache_miss:
-        ; Normal fetch/decode path
-        jsr fetch8
-        sta jit_handler_idx     ; Save opcode for caching
-        tax
-        
-        ; Look up instruction length for cache storage
-        lda jit_inst_lengths,x
-        sta jit_inst_length
-        
-        ; Get handler address
-        lda op_vec_lo,x
-        sta p4_vec_lo
-        lda op_vec_hi,x
-        sta p4_vec_hi
-        
-        ; Store in cache for next time (only if ROM address)
-        jsr JIT_StoreCache
-        
-        ; Execute
-        jmp (p4_vec_lo)
-.else
-        ; --------------------------------------------------------
-        ; Normal fetch/decode/execute - NO JIT
+        ; Fetch/decode/execute
         ; --------------------------------------------------------
         jsr fetch8
         tax
@@ -741,7 +615,6 @@ _jit_cache_miss:
         
         ; Execute
         jmp (p4_vec_lo)
-.endif
 
 op_illegal:
         ;lda #2

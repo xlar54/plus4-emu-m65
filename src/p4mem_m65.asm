@@ -1098,18 +1098,9 @@ p4mem_write_check_fd:
         
         lda p4_addr_lo
         cmp #$30
-        bne _write_chk_fd3f
+        bne _write_chk_fdd0
         lda p4_data
         sta $DC00
-        rts
-
-_write_chk_fd3f:
-        cmp #$3F
-        bne _write_chk_fdd0
-        ; $FD3F = JIT runtime control
-        ; POKE 64831,0 = JIT off, POKE 64831,1 = JIT on
-        lda p4_data
-        sta jit_runtime_enabled
         rts
 
 _write_chk_fdd0:
