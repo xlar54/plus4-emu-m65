@@ -72,6 +72,7 @@ p4_save_d020:     .byte 0
 p4_save_d021:     .byte 0
 
 p4_multicolor:    .byte 0     ; 0=hires, 1=multicolor
+p4_file_op_active: .byte 0      ; 1 = file operation in progress, don't switch video modes
 
 ; ============================================================
 ; P4MEM_Init - Initialize memory system
@@ -664,11 +665,17 @@ _ted_cursor_changed:
 
 _ted_reg12_write:
         ; $FF12 handles: sound voice 1 high bits, video mode, AND charset
-        ; First do sound
+        ; 
+        ; Only update sound if voice 1 is currently active.
+        ; This prevents GRAPHIC mode changes from triggering sound blips
+        ; when $FF12 is written for video purposes only.
+        lda p4snd_voice1_on
+        beq _ted_reg12_skip_sound
         lda ted_regs+$12
         and #$03
         sta p4snd_v1_freq_hi
         jsr P4SND_UpdateVoice1_WithHigh
+_ted_reg12_skip_sound:
         ; Then check video mode
         jsr P4VID_GfxConfigChanged
         ; Then check charset
@@ -859,16 +866,14 @@ _host_set:
 ; ============================================================
 P4VID_GfxConfigChanged:
 
+        ; Don't switch video modes during file operations
+        lda p4_file_op_active
+        bne _gfx_skip
+
         ; Check TED $FF06 bit 5 for bitmap mode
         lda ted_regs+$06
         and #$20                ; Check bitmap mode bit (bit 5)
         beq _gfx_to_text
-        
-        ; Bitmap bit is set - but only enter if also confirmed by $FF12
-        ; Real GRAPHIC mode sets both $FF06 bit 5 AND $FF12 bits appropriately
-        lda ted_regs+$12
-        and #$38                ; Bitmap address bits
-        beq _gfx_to_text        ; If zero, probably not real graphics mode
 
 _gfx_enter_bitmap:
         ; Enter bitmap mode - determine if multicolor
@@ -905,10 +910,9 @@ _gfx_to_text:
         lda #0
         sta p4_video_mode
         sta p4_multicolor
-        lda #1
-        sta p4_gfx_dirty
         jsr P4VID_DisableHostBitmap
 _gfx_already_text:
+_gfx_skip:
         rts
 
 ; ============================================================
@@ -1151,12 +1155,6 @@ _mcm_cleared:
         lda #1
         sta p4_screen_fill_pending
         rts
-
-_setup_hires_colors:
-        ; Not used - screen fill is deferred to P4VID_Frame
-        rts
-
-_hires_fill_byte: .byte 0
 
 ; ============================================================
 ; P4VID_DoScreenFill - Fill screen RAM (called from P4VID_Frame)

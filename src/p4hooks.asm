@@ -466,6 +466,7 @@ p4_prg_header_lo: .byte 0
 p4_prg_header_hi: .byte 0
 
 P4HOOK_DoHostLoad:
+
         ; Set up host KERNAL for file operations
         lda #$00
         ldx #$00
@@ -517,7 +518,11 @@ _dhl_header_chkin_error:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
-        jsr P4MEM_InitVideo
+
+        ; Load failed - restore video state
+        jsr FileAccessFailed
+
+        ; Load failed
         jmp _dhl_error_set
 
 _dhl_do_load_after_header:
@@ -539,16 +544,42 @@ _dhl_do_load:
 +       ldy #$00                        ; SA=0: use X/Y address, not file header
         jsr SETLFS
         
+        ; Disable video mode switching during file operation
+        lda #1
+        sta p4_file_op_active
+
+        ; Save VIC state before LOAD
+        lda $D011
+        sta _save_d011_load
+        lda $D018
+        sta _save_d018_load
+        lda $DD00
+        sta _save_dd00_load
+        
         ; Load to staging buffer
         lda #$00                        ; 0 = LOAD (not verify)
         ldx #<P4_DIR_BUF
         ldy #>P4_DIR_BUF
         jsr LOAD
+        php                             ; Save carry flag (success/fail)
+        
+        ; Restore VIC state immediately
+        lda _save_dd00_load
+        sta $DD00
+        lda _save_d018_load
+        sta $D018
+        lda _save_d011_load
+        sta $D011
+        
+        ; Disable video mode switching during file operation
+        lda #0
+        sta p4_file_op_active
+
+        plp                             ; Restore carry flag
         bcc _dhl_load_ok
         
         ; Load failed - restore video state
-        jsr P4MEM_InitVideo             ; <-- ADD THIS LINE
-        
+        jsr FileAccessFailed
 
         ; Load failed
         jmp _dhl_error_set
@@ -640,6 +671,27 @@ _dhl_set_pc:
         sta p4_pc_hi
         rts
 
+_save_d011_load: .byte 0
+_save_d018_load: .byte 0
+_save_dd00_load: .byte 0
+
+FileAccessFailed:
+        ; Load failed - restore video state
+        jsr P4MEM_InitVideo
+        
+        ; Reset bitmap mode flags to prevent flash
+        lda #0
+        sta p4_video_mode
+        sta p4_host_bmp_on
+        sta p4_gfx_dirty
+        
+        ; Silence any sound
+        lda #$00
+        sta SID_BASE + SID_V1_CTRL
+        sta SID_BASE + SID_V2_CTRL
+        sta SID_BASE + SID_V3_CTRL
+
+        rts
 
 ; ============================================================
 ; Hook: SAVE - Handle file saving
