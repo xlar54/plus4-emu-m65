@@ -121,6 +121,9 @@ p4_save_start_hi: .byte 0
 p4_save_end_lo:   .byte 0       ; End address + 1
 p4_save_end_hi:   .byte 0
 
+; Monitor LOAD flag - if set, return via RTS not jump to BASIC
+p4_monitor_load:  .byte 0
+
 ; ------------------------------------------------------------
 ; P4HOOK_CheckAndRun
 ;   Called once per emulated instruction, right before opcode fetch.
@@ -134,7 +137,7 @@ P4HOOK_CheckAndRun:
 
         lda p4_pc_hi
 
-        ; ----- Check for $FFxx addresses (SETNAM, SETLFS, SAVE) -----
+        ; ----- Check for $FFxx addresses (SETNAM, SETLFS, SAVE, LOAD) -----
         cmp #$FF
         bne _not_ff
         lda p4_pc_lo
@@ -144,6 +147,8 @@ P4HOOK_CheckAndRun:
         beq _do_setlfs
         cmp #$D8                        ; SAVE = $FFD8
         beq _do_save
+        cmp #$D5                        ; LOAD = $FFD5
+        beq _do_load_direct
         jmp _check_other
 
 _do_setnam:
@@ -156,6 +161,41 @@ _do_setlfs:
 
 _do_save:
         jsr P4HOOK_OnSAVE
+        jmp _done
+
+_do_load_direct:
+        ; HACK: Distinguish BASIC LOAD from Monitor L command
+        ; 
+        ; Problem: BASIC LOAD is hooked at $A800 (JSR $FFD5 inside BASIC).
+        ; Monitor L command calls $FFD5 directly, bypassing $A800.
+        ; We need to intercept monitor but not interfere with BASIC.
+        ;
+        ; Solution: Check the return address on the 6502 stack.
+        ; - BASIC: JSR $FFD5 at $A800 pushes return addr $A802 (addr-1)
+        ; - Monitor: Return address will be somewhere else (monitor ROM)
+        ;
+        ; If return address is $A802, skip - the $A800 hook handles BASIC.
+        ; Otherwise, this is the monitor - handle LOAD here.
+        ;
+        ldy p4_sp
+        iny                             ; Point to return address lo on stack
+        lda #$01
+        sta p4_addr_hi
+        sty p4_addr_lo
+        jsr P4MEM_Read
+        cmp #$02                        ; Return lo = $02?
+        bne _do_load_monitor
+        iny
+        sty p4_addr_lo
+        jsr P4MEM_Read
+        cmp #$A8                        ; Return hi = $A8?
+        bne _do_load_monitor
+        ; Return addr is $A802 = BASIC calling $FFD5, skip
+        jmp _done
+        
+_do_load_monitor:
+        ; Monitor or other non-BASIC caller - handle LOAD here
+        jsr P4HOOK_OnLOAD
         jmp _done
 
 _not_ff:
@@ -286,7 +326,55 @@ P4HOOK_OnLOAD:
         jmp _load_file
 
 _load_no_setnam:
-        ; No SETNAM data - can't do anything, let ROM handle it
+        ; No SETNAM called - check if monitor set filename directly
+        ; Monitor stores: $AB = length, $AF/$B0 = pointer (pointing to $025D)
+        lda LOW_RAM_BUFFER + $AB        ; Filename length
+        beq _load_no_setnam_rts         ; No filename, let ROM handle
+        cmp #17
+        bcs _load_no_setnam_rts         ; Too long, let ROM handle
+        
+        ; Mark this as a monitor load - needs RTS return, not jump to BASIC
+        pha
+        lda #1
+        sta p4_monitor_load
+        pla
+        
+        ; Get SETLFS values from KERNAL variables
+        ; $AC = logical file, $AD = secondary address, $AE = device
+        lda LOW_RAM_BUFFER + $AD        ; Secondary address
+        sta p4_setlfs_sa
+        lda LOW_RAM_BUFFER + $AE        ; Device number
+        sta p4_setlfs_dev
+        
+        ; Use KERNAL variables - copy filename from LOW_RAM_BUFFER
+        ; since monitor stores filename at $025D which is in low RAM
+        lda LOW_RAM_BUFFER + $AB        ; Reload filename length
+        sta p4_fl_len
+        
+        ; Set up pointer: LOW_RAM_BUFFER + $AF/$B0 value
+        lda LOW_RAM_BUFFER + $AF        ; Pointer lo ($5D)
+        sta $FB
+        clc
+        lda LOW_RAM_BUFFER + $B0        ; Pointer hi ($02)
+        adc #>LOW_RAM_BUFFER            ; Add $A0 -> $A2
+        sta $FC
+        
+        ; Copy filename bytes
+        ldy #0
+_load_copy_fn:
+        cpy p4_fl_len
+        beq _load_copy_done
+        lda ($FB),y
+        sta p4_fl_buf,y
+        iny
+        cpy #17
+        bcc _load_copy_fn
+_load_copy_done:
+        lda #0
+        sta p4_fl_buf,y                 ; Null terminate
+        jmp _load_do_it                 ; Skip to loading
+
+_load_no_setnam_rts:
         rts
 
 _load_directory:
@@ -315,11 +403,13 @@ _load_file:
         ; Clear the valid flag
         lda #0
         sta p4_setnam_valid
+        sta p4_monitor_load             ; Clear monitor flag - this is BASIC load
         
         ; Copy filename from guest RAM to our buffer
         jsr P4HOOK_CopyFilename
         bcs _load_file_error
         
+_load_do_it:
         ; Print "SEARCHING FOR "
         lda #<P4Host_Msg_Searching
         ldx #>P4Host_Msg_Searching
@@ -598,7 +688,18 @@ _dhl_error_set:
         sta p4_a
 
 _dhl_set_pc:
-        ; Skip past the JSR $FFD5
+        ; Check if this was a monitor load
+        lda p4_monitor_load
+        beq _dhl_basic_return
+        
+        ; Monitor load - return via RTS to caller
+        lda #0
+        sta p4_monitor_load             ; Clear the flag
+        jsr P4HOOK_RTS_Guest
+        rts
+        
+_dhl_basic_return:
+        ; BASIC load - skip past the JSR $FFD5
         lda #<P4HOOK_ROM_AFTER_KERNAL_CALL
         sta p4_pc_lo
         lda #>P4HOOK_ROM_AFTER_KERNAL_CALL
