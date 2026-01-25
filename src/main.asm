@@ -448,4 +448,6 @@ fail_msg:
         .include "plus4_cpu_m65.asm"
         .include "p4hooks.asm"
         .include "p4mem_m65.asm"
+        .include "plus4_sound_m65.asm"
         .include "p4host.asm"
+        
