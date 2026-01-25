@@ -126,26 +126,17 @@ p4_save_end_hi:   .byte 0
 ;   Called once per emulated instruction, right before opcode fetch.
 ; ------------------------------------------------------------
 P4HOOK_CheckAndRun:
-        ; Quick check - most instructions are not at hook addresses
-        ; Only save registers if we might actually run a hook
+        pha
+        txa
+        pha
+        tya
+        pha
+
         lda p4_pc_hi
 
         ; ----- Check for $FFxx addresses (SETNAM, SETLFS, SAVE) -----
         cmp #$FF
-        beq _check_ff_hooks
-        
-        ; ----- Check for $C8xx (DIRECTORY at $C8BC) -----
-        cmp #$C8
-        beq _check_c8_hooks
-        
-        ; ----- Check for LOAD hook at $A800 -----
-        cmp #$A8
-        beq _check_a8_hooks
-        
-        ; No hook - fast return without saving registers
-        rts
-
-_check_ff_hooks:
+        bne _not_ff
         lda p4_pc_lo
         cmp #$BD                        ; SETNAM = $FFBD
         beq _do_setnam
@@ -153,68 +144,47 @@ _check_ff_hooks:
         beq _do_setlfs
         cmp #$D8                        ; SAVE = $FFD8
         beq _do_save
-        rts
+        jmp _check_other
 
-_check_c8_hooks:
-        lda p4_pc_lo
-        cmp #$BC                        ; DIRECTORY = $C8BC
-        beq _do_directory
-        rts
-
-_check_a8_hooks:
-        lda p4_pc_lo
-        bne _done_no_restore
-        ; We're at $A800 - the JSR $FFD5 inside BASIC LOAD
-        jmp _do_load
-
-_done_no_restore:
-        rts
-
-; --- Actual hook handlers (save registers first) ---
 _do_setnam:
-        pha
-        txa
-        pha
-        tya
-        pha
         jsr P4HOOK_OnSETNAM
         jmp _done
 
 _do_setlfs:
-        pha
-        txa
-        pha
-        tya
-        pha
         jsr P4HOOK_OnSETLFS
         jmp _done
 
 _do_save:
-        pha
-        txa
-        pha
-        tya
-        pha
         jsr P4HOOK_OnSAVE
         jmp _done
 
-_do_directory:
-        pha
-        txa
-        pha
-        tya
-        pha
+_not_ff:
+        ; ----- Check for $C8xx (DIRECTORY at $C8BC) -----
+        cmp #$C8
+        bne _check_a8
+        lda p4_pc_lo
+        cmp #$BC                        ; DIRECTORY = $C8BC
+        bne _done
         jsr P4HOOK_OnDIRECTORY
         jmp _done
 
-_do_load:
-        pha
-        txa
-        pha
-        tya
-        pha
+_check_a8:
+        ; ----- Check for LOAD hook at $A800 -----
+        cmp #$A8
+        bne _done
+        lda p4_pc_lo
+        cmp #$00
+        bne _done
+
+_check_other:
+        lda p4_pc_hi
+        cmp #$A8
+        bne _done
+        lda p4_pc_lo
+        bne _done
+        
+        ; We're at $A800 - the JSR $FFD5 inside BASIC LOAD
         jsr P4HOOK_OnLOAD
-        jmp _done
 
 _done:
         pla
@@ -466,7 +436,6 @@ p4_prg_header_lo: .byte 0
 p4_prg_header_hi: .byte 0
 
 P4HOOK_DoHostLoad:
-
         ; Set up host KERNAL for file operations
         lda #$00
         ldx #$00
@@ -518,11 +487,6 @@ _dhl_header_chkin_error:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
-
-        ; Load failed - restore video state
-        jsr FileAccessFailed
-
-        ; Load failed
         jmp _dhl_error_set
 
 _dhl_do_load_after_header:
@@ -544,43 +508,13 @@ _dhl_do_load:
 +       ldy #$00                        ; SA=0: use X/Y address, not file header
         jsr SETLFS
         
-        ; Disable video mode switching during file operation
-        lda #1
-        sta p4_file_op_active
-
-        ; Save VIC state before LOAD
-        lda $D011
-        sta _save_d011_load
-        lda $D018
-        sta _save_d018_load
-        lda $DD00
-        sta _save_dd00_load
-        
         ; Load to staging buffer
         lda #$00                        ; 0 = LOAD (not verify)
         ldx #<P4_DIR_BUF
         ldy #>P4_DIR_BUF
         jsr LOAD
-        php                             ; Save carry flag (success/fail)
-        
-        ; Restore VIC state immediately
-        lda _save_dd00_load
-        sta $DD00
-        lda _save_d018_load
-        sta $D018
-        lda _save_d011_load
-        sta $D011
-        
-        ; Disable video mode switching during file operation
-        lda #0
-        sta p4_file_op_active
-
-        plp                             ; Restore carry flag
         bcc _dhl_load_ok
         
-        ; Load failed - restore video state
-        jsr FileAccessFailed
-
         ; Load failed
         jmp _dhl_error_set
 
@@ -671,27 +605,6 @@ _dhl_set_pc:
         sta p4_pc_hi
         rts
 
-_save_d011_load: .byte 0
-_save_d018_load: .byte 0
-_save_dd00_load: .byte 0
-
-FileAccessFailed:
-        ; Load failed - restore video state
-        jsr P4MEM_InitVideo
-        
-        ; Reset bitmap mode flags to prevent flash
-        lda #0
-        sta p4_video_mode
-        sta p4_host_bmp_on
-        sta p4_gfx_dirty
-        
-        ; Silence any sound
-        lda #$00
-        sta SID_BASE + SID_V1_CTRL
-        sta SID_BASE + SID_V2_CTRL
-        sta SID_BASE + SID_V3_CTRL
-
-        rts
 
 ; ============================================================
 ; Hook: SAVE - Handle file saving
@@ -708,12 +621,52 @@ FileAccessFailed:
 P4HOOK_OnSAVE:
         ; Check if we have valid SETNAM data
         lda p4_setnam_valid
-        beq _save_no_setnam
+        bne _save_have_setnam
         
+        ; No SETNAM called - check if monitor set filename directly
+        ; Monitor stores: $AB = length, $AF/$B0 = pointer (pointing to $025D)
+        lda LOW_RAM_BUFFER + $AB        ; Filename length
+        beq _save_no_setnam             ; No filename, let ROM handle
+        cmp #17
+        bcs _save_no_setnam             ; Too long, let ROM handle
+        
+        ; Use KERNAL variables - copy filename from LOW_RAM_BUFFER
+        ; since monitor stores filename at $025D which is in low RAM
+        sta p4_fl_len
+        
+        ; Set up pointer: LOW_RAM_BUFFER + $AF/$B0 value
+        lda LOW_RAM_BUFFER + $AF        ; Pointer lo ($5D)
+        sta $FB
+        clc
+        lda LOW_RAM_BUFFER + $B0        ; Pointer hi ($02)
+        adc #>LOW_RAM_BUFFER            ; Add $A0 -> $A2
+        sta $FC
+        
+        ; Copy filename bytes
+        ldy #0
+_save_copy_fn:
+        cpy p4_fl_len
+        beq _save_copy_done
+        lda ($FB),y
+        sta p4_fl_buf,y
+        iny
+        cpy #17
+        bcc _save_copy_fn
+_save_copy_done:
+        lda #0
+        sta p4_fl_buf,y                 ; Null terminate
+        bra _save_do_it
+        
+_save_have_setnam:
         ; Clear the valid flag
         lda #0
         sta p4_setnam_valid
         
+        ; Copy filename from guest RAM to buffer (uses bank 5)
+        jsr P4HOOK_CopyFilename
+        bcs _save_error
+        
+_save_do_it:
         ; Get end address from X/Y registers
         lda p4_x
         sta p4_save_end_lo
@@ -732,10 +685,6 @@ P4HOOK_OnSAVE:
         inx
         lda LOW_RAM_BUFFER,x            ; Start hi
         sta p4_save_start_hi
-        
-        ; Copy filename from guest RAM to buffer
-        jsr P4HOOK_CopyFilename
-        bcs _save_error
         
         ; Perform the save
         jsr P4HOOK_DoHostSave
