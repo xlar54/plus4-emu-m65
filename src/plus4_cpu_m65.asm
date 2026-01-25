@@ -379,15 +379,18 @@ _ted_check_wrap:
         bcc _ted_check_irq
         ; Wrap to line 0
         lda #0
-		sta ted_raster_lo
-		sta ted_raster_hi
+        sta ted_raster_lo
+        sta ted_raster_hi
 
-		; Present video once per frame (bitmap mode uses this)
-		jsr P4VID_Frame
+        ; Present video once per frame (bitmap mode uses this)
+        jsr P4VID_Frame
 
-		; Cursor blink only makes sense in text mode
-		lda p4_video_mode
-		bne _no_cur_toggle
+        ; Check MEGA65 cursor keys and inject into Plus/4 buffer (once per frame)
+        ;jsr P4_CheckCursorKeys
+
+        ; Cursor blink only makes sense in text mode
+        lda p4_video_mode
+        bne _no_cur_toggle
 
         inc p4_cur_div
         lda p4_cur_div
@@ -2187,8 +2190,29 @@ op_8c:
 ; $8D STA abs
 op_8d:
         jsr addr_abs
+        ; Disable interrupts early - IRQ handler corrupts A register!
+        sei
         lda p4_a
         sta p4_data
+        ; Check for $FD30 or $FF08 write - keyboard selector
+        ldx $0A                 ; p4_addr_hi
+        cpx #$FD
+        bne _op8d_check_ff
+        ldx $09                 ; p4_addr_lo
+        cpx #$30
+        bne _op8d_not_kbd_cli
+        sta p4_kbd_sel          ; Save keyboard selector
+        bra _op8d_not_kbd_cli
+_op8d_check_ff:
+        cpx #$FF
+        bne _op8d_not_kbd_cli
+        ldx $09                 ; p4_addr_lo
+        cpx #$08
+        bne _op8d_not_kbd_cli
+        sta p4_kbd_sel          ; Save keyboard selector (FF08 write)
+_op8d_not_kbd_cli:
+        cli
+_op8d_not_fd30:
         jsr P4MEM_Write
         lda #4
         jmp finish_cycles

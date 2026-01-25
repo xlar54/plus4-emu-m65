@@ -36,6 +36,7 @@ P4_TCOLOR       = LOW_RAM_BUFFER + $07ED
 ; Located in zero page for use with 32-bit indirect addressing
 ; Format: [lo, hi, bank, megabyte]
 P4_MEM_PTR      = $F0                   ; 4 bytes at $F0-$F3
+p4_saved_data   = $F4                   ; Saved p4_data at P4MEM_Write entry (ZP for safety)
 
 ; State variables
 p4_rom_visible:      .byte 1    ; 1 = ROM visible, 0 = RAM only
@@ -343,8 +344,105 @@ _read_ff19:
         rts
 
 _read_keyboard:
+        ; Check and inject cursor keys on every keyboard poll
+        jsr P4_CheckCursorKeys
+        
+        ; Read CIA column selector
+        lda $DC00
+        sta _kb_selector
+        
+        ; Read CIA result
         lda $DC01
+        
+        ; Mask out C64 cursor keys to prevent ghost characters
+        ; C64 cursor DOWN/UP is column 0 ($FE), row 7 (bit 7)
+        ; C64 cursor RIGHT/LEFT is column 0 ($FE), row 2 (bit 2)
+        ldx _kb_selector
+        cpx #$FE                ; Column 0?
+        bne _kb_done
+        ora #$84                ; Force bits 7 and 2 HIGH (mask out cursors)
+_kb_done:
         rts
+
+_kb_selector: .byte $FF
+
+        ; Get the selector that Plus/4 wrote
+        lda $DC00
+        sta _kb_selector
+        
+        ; Get the base result from CIA
+        lda $DC01
+        sta _kb_result
+
+        ; Check if Plus/4 is scanning column $DF (UP/DOWN cursor)
+        lda _kb_selector
+        and #$20
+        bne _kb_check_bf
+        
+        ; Scanning $DF - inject cached cursor UP/DOWN state
+        lda cursor_down_pressed
+        beq _kb_check_up
+        lda _kb_result
+        and #$FE                ; DOWN = clear bit 0
+        sta _kb_result
+        
+_kb_check_up:
+        lda cursor_up_pressed
+        beq _kb_check_bf
+        lda _kb_result
+        and #$F7                ; UP = clear bit 3
+        sta _kb_result
+
+_kb_check_bf:
+        ; Check if Plus/4 is scanning column $BF (LEFT/RIGHT cursor)
+        lda _kb_selector
+        and #$40
+        bne _kb_check_at
+        
+        ; Scanning $BF - inject cached cursor LEFT/RIGHT state
+        lda cursor_right_pressed
+        beq _kb_check_left
+        lda _kb_result
+        and #$F7                ; RIGHT = clear bit 3
+        sta _kb_result
+
+_kb_check_left:
+        lda cursor_left_pressed
+        beq _kb_check_at
+        lda _kb_result
+        and #$FE                ; LEFT = clear bit 0
+        sta _kb_result
+
+_kb_check_at:
+        ; HACK: Suppress @ ghost when cursor down is pressed
+        ; @ is at column $7F (bit 7 clear), row bit 0
+        ; When cursor down sets row bit 0 low, it can ghost to @
+        lda cursor_down_pressed
+        beq _kb_done
+        
+        ; Check if scanning column $7F (bit 7 clear)
+        lda _kb_selector
+        and #$80
+        bne _kb_done            ; Bit 7 set = not column $7F
+        
+        ; We ARE scanning column $7F and cursor down is pressed
+        ; Force bit 0 HIGH to suppress @ ghost
+        lda _kb_result
+        ora #$01
+        sta _kb_result
+
+_kb_donew:
+        lda _kb_result
+        rts
+
+_kb_result:      .byte $FF
+_kb_selectorw:    .byte $FF
+
+; Cursor key state - updated once per frame by P4_CheckCursorKeys
+cursor_up_pressed:    .byte 0
+cursor_down_pressed:  .byte 0
+cursor_left_pressed:  .byte 0
+cursor_right_pressed: .byte 0
 
 _read_raster_lo:
         lda ted_raster_lo
@@ -424,6 +522,10 @@ read_from_basic:
 ;        p4_data = byte to write
 ; ============================================================
 P4MEM_Write:
+        ; Save p4_data immediately since something corrupts $0B
+        lda p4_data
+        sta p4_saved_data
+        
         lda p4_addr_hi
         
         ; Check for low RAM $0000-$0FFF (in local buffer for fast mirroring)
@@ -436,7 +538,7 @@ P4MEM_Write:
         adc #>LOW_RAM_BUFFER
         sta _write_low+2
         ldx p4_addr_lo
-        lda p4_data
+        lda p4_saved_data
 _write_low:
         sta LOW_RAM_BUFFER,x            ; High byte modified
 
@@ -468,7 +570,7 @@ _do_color_mirror:
         adc #$D0                        ; $08->$D8, $09->$D9, etc.
         sta _col_mir+2
         ldx p4_addr_lo
-        lda p4_data
+        lda p4_saved_data
         and #$7F                        ; TED color is 7 bits
         tay
         lda ted_to_c64_color,y          ; Map to 16 C64 colors
@@ -477,6 +579,21 @@ _col_mir:
         rts
         
 _write_not_low_ram:
+        cmp #$FD
+        bne _write_not_fd
+        ; $FD page - keyboard selector
+        lda p4_addr_lo
+        cmp #$30
+        bne _write_fd_other
+        ; $FD30 - write directly from p4_a (emulated accumulator)
+        lda p4_a
+        sta $DC00
+        rts
+_write_fd_other:
+        ; Other $FD addresses - go to normal handler
+        jmp p4mem_write_check_fd
+        
+_write_not_fd:
         cmp #$FF
         beq _write_ff_page
         jmp p4mem_write_check_fd
@@ -503,7 +620,7 @@ _write_not_ff3e:
         ; $FF00-$FF3F: ALL are TED registers (with $FF20-$FF3F mirroring $FF00-$FF1F)
         and #$1F                        ; Mask to $00-$1F (handle mirroring)
         tax
-        lda p4_data
+        lda p4_saved_data
         sta ted_regs,x
 
         ; Check for sound register writes
@@ -513,6 +630,8 @@ _write_not_ff3e:
         ;
         ; For SOUND 2/3, we ONLY trigger when $FF11 is written (last in sequence)
         ; This ensures all frequency values are in place before playing
+        cpx #$08
+        beq _ted_kbd_latch              ; $FF08 - keyboard/joystick latch
         cpx #$0E
         beq _ted_sound_v1_changed       ; Voice 1 freq low - triggers update
         cpx #$0F
@@ -531,6 +650,11 @@ _write_not_ff3e:
         cpx #$0D
         beq _ted_cursor_changed
         bra _ted_check_video
+
+_ted_kbd_latch:
+        ; $FF08 write - keyboard selector already captured by CPU op_8d
+        ; Just return, nothing else needed here
+        rts
 
 _ted_cursor_changed:
         phx
@@ -586,7 +710,7 @@ _write_ff01:
         rts
 
 _write_ff09:
-        lda p4_data
+        lda p4_saved_data
         eor #$FF
         and ted_regs+$09
         sta ted_regs+$09
@@ -596,7 +720,7 @@ _write_ff15:
         ; Background color - store in ted_regs AND apply to VIC-IV
         ; In text mode, use TED color directly (128-color palette)
         ; Value is also stored for bitmap mode to map later
-        lda p4_data
+        lda p4_saved_data
         sta ted_regs+$15        ; Store in TED register shadow
         and #$7F                ; TED color is 7 bits (0-127)
         sta $D021               ; VIC-IV uses our custom 128-color palette
@@ -605,7 +729,7 @@ _write_ff15:
 _write_ff19:
         ; Border color - store in ted_regs AND apply to VIC-IV
         ; In text mode, use TED color directly (128-color palette)
-        lda p4_data
+        lda p4_saved_data
         sta ted_regs+$19        ; Store in TED register shadow
         and #$7F                ; TED color is 7 bits (0-127)
         sta $D020               ; VIC-IV uses our custom 128-color palette
@@ -1184,8 +1308,9 @@ p4mem_write_check_fd:
         lda p4_addr_lo
         cmp #$30
         bne _write_chk_fdd0
+        ; $FD30 - keyboard selector already captured by CPU op_8d
         lda p4_data
-        sta $DC00
+        sta $DC00               ; Also write to CIA for other keys
         rts
 
 _write_chk_fdd0:
@@ -1207,7 +1332,7 @@ p4mem_write_to_ram:
         sta P4_MEM_PTR+3
         
         ldz #$00
-        lda p4_data
+        lda p4_saved_data
         sta [P4_MEM_PTR],z
 
         ; If this write hits the active bitmap region, mark frame dirty
@@ -1911,4 +2036,190 @@ ted_to_c64_color:
         .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
         .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
         .byte $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0A,$0B,$0C,$0D,$0E,$0F
+
+
+; ============================================================
+; Cursor Key Injection for MEGA65
+; ============================================================
+;
+; Injects cursor key PETSCII codes directly into the Plus/4
+; keyboard buffer, bypassing matrix scanning entirely.
+;
+; Plus/4 keyboard buffer (in LOW_RAM_BUFFER mirror):
+;   Guest $0527-$0530 = KEYD -> Host $A527
+;   Guest $00EF = NDX -> Host $A0EF
+;
+; MEGA65 $D604: Bit 0 = LEFT, Bit 1 = UP (active high)
+; MEGA65 $D611: Bits 0-1 = shift keys
+;
+; ============================================================
+
+; Host addresses for Plus/4 keyboard buffer
+P4_NDX_HOST  = $A0EF            ; LOW_RAM_BUFFER + $EF
+P4_KEYD_HOST = $A527            ; LOW_RAM_BUFFER + $527
+P4_KEYD_MAX  = 10               ; Maximum buffer size
+
+; PETSCII cursor codes
+PETSCII_DOWN  = $11
+PETSCII_UP    = $91
+PETSCII_RIGHT = $1D
+PETSCII_LEFT  = $9D
+
+; ============================================================
+; P4_CheckCursorKeys - Hybrid: $D610 for up/left, CIA for down/right
+; ============================================================
+P4_CheckCursorKeys:
+        ; Save current CIA state
+        lda $DC00
+        sta _cki_saved_dc00
         
+        ; Read shift column FIRST (column 6 = $BF)
+        lda #$BF
+        sta $DC00
+        nop
+        nop
+        lda $DC01
+        and #$10                ; Right shift is bit 4
+        sta _cki_shift          ; 0 = shift pressed, $10 = not pressed
+        
+        ; Read cursor column (column 0 = $FE)
+        lda #$FE
+        sta $DC00
+        nop
+        nop
+        lda $DC01
+        sta _cki_cursor_bits
+        
+        ; Restore CIA
+        lda _cki_saved_dc00
+        sta $DC00
+        
+        ; Check vertical cursor (bit 7 LOW = pressed)
+        lda _cki_cursor_bits
+        and #$80
+        bne _cki_vert_released      ; Bit 7 HIGH = not pressed
+        
+        ; Vertical cursor is pressed
+        lda _cki_vert_held
+        bne _cki_vert_repeat
+        
+        ; New press
+        lda #$01
+        sta _cki_vert_held
+        lda #$00
+        sta _cki_vert_cnt
+        lda _cki_shift
+        bne _cki_inject_down        ; $10 = no shift = DOWN
+        lda #$91                    ; 0 = shift = UP
+        jsr P4_InjectKey
+        bra _cki_check_horiz
+_cki_inject_down:
+        lda #$11
+        jsr P4_InjectKey
+        bra _cki_check_horiz
+        
+_cki_vert_repeat:
+        inc _cki_vert_cnt
+        lda _cki_vert_cnt
+        cmp #100
+        bcc _cki_check_horiz
+        lda #70
+        sta _cki_vert_cnt
+        lda _cki_shift
+        bne _cki_rep_down
+        lda #$91
+        jsr P4_InjectKey
+        bra _cki_check_horiz
+_cki_rep_down:
+        lda #$11
+        jsr P4_InjectKey
+        bra _cki_check_horiz
+        
+_cki_vert_released:
+        lda #$00
+        sta _cki_vert_held
+        sta _cki_vert_cnt
+        
+_cki_check_horiz:
+        ; Check horizontal cursor (bit 2 LOW = pressed)
+        lda _cki_cursor_bits
+        and #$04
+        bne _cki_horiz_released     ; Bit 2 HIGH = not pressed
+        
+        ; Horizontal cursor is pressed
+        lda _cki_horiz_held
+        bne _cki_horiz_repeat
+        
+        ; New press
+        lda #$01
+        sta _cki_horiz_held
+        lda #$00
+        sta _cki_horiz_cnt
+        lda _cki_shift
+        bne _cki_inject_right       ; $10 = no shift = RIGHT
+        lda #$9D                    ; 0 = shift = LEFT
+        jsr P4_InjectKey
+        bra _cki_done
+_cki_inject_right:
+        lda #$1D
+        jsr P4_InjectKey
+        bra _cki_done
+        
+_cki_horiz_repeat:
+        inc _cki_horiz_cnt
+        lda _cki_horiz_cnt
+        cmp #100
+        bcc _cki_done
+        lda #70
+        sta _cki_horiz_cnt
+        lda _cki_shift
+        bne _cki_rep_right
+        lda #$9D
+        jsr P4_InjectKey
+        bra _cki_done
+_cki_rep_right:
+        lda #$1D
+        jsr P4_InjectKey
+        bra _cki_done
+        
+_cki_horiz_released:
+        lda #$00
+        sta _cki_horiz_held
+        sta _cki_horiz_cnt
+        
+_cki_done:
+        rts
+
+_cki_saved_dc00:  .byte $FF
+_cki_cursor_bits: .byte $FF
+_cki_shift:       .byte $00
+_cki_vert_held:   .byte $00
+_cki_vert_cnt:    .byte $00
+_cki_horiz_held:  .byte $00
+_cki_horiz_cnt:   .byte $00
+
+; ============================================================
+; P4_InjectKey - Inject a PETSCII key into Plus/4 keyboard buffer
+; Input: A = PETSCII code to inject
+; Clobbers: A, X
+; (Kept for potential future use)
+; ============================================================
+P4_InjectKey:
+        pha                     ; Save key code
+
+        ; Check if buffer has room
+        ldx P4_NDX_HOST         ; Read current count from host mirror
+        cpx #P4_KEYD_MAX
+        bcs _ik_full            ; Buffer full
+
+        ; Store key at buffer[NDX]
+        pla                     ; Get key code
+        sta P4_KEYD_HOST,x      ; Store in keyboard buffer
+
+        ; Increment buffer count
+        inc P4_NDX_HOST
+        rts
+
+_ik_full:
+        pla                     ; Discard key code
+        rts
