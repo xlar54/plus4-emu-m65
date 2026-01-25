@@ -23,15 +23,19 @@ P4_SAVE                 = $FFD8         ; SAVE entry point
 P4_OPEN                 = $FFC0         ; OPEN
 P4_CLOSE                = $FFC3         ; CLOSE
 P4_CHKIN                = $FFC6         ; CHKIN
+P4_CHKOUT               = $FFC9         ; CHKOUT  
 P4_CLRCHN               = $FFCC         ; CLRCHN
 P4_CHRIN                = $FFCF         ; CHRIN
+; P4_CHROUT defined in p4host.asm
 P4_READST               = $FFB7         ; READST
 
 
-; MEGA65 KERNAL routines for output
-CHKOUT                  = $FFC9         ; Set output channel
-;CHROUT                  = $FFD2         ; Output character
-;CLRCHN                  = $FFCC         ; Clear channels
+; MEGA65 KERNAL routines are defined in main.asm:
+; OPEN, CLOSE, CHKIN, CHKOUT, CLRCHN, CHRIN, CHROUT, READST
+
+; Sequential file I/O constants
+MAX_SEQ_FILES           = 4             ; Maximum simultaneous open files
+SEQ_LFN_BASE            = 10            ; Host logical file numbers start here
 
 ; Inside BASIC LOAD handler: the JSR $FFD5 instruction
 P4HOOK_ROM_LOAD_KERNAL_CALL      = $A800
@@ -125,6 +129,30 @@ p4_save_end_hi:   .byte 0
 p4_monitor_load:  .byte 0
 
 ; ------------------------------------------------------------
+; Sequential File I/O Variables
+; ------------------------------------------------------------
+; We support up to MAX_SEQ_FILES (4) simultaneous open files.
+; Each slot tracks: guest LFN, device, SA, host LFN, status
+;
+; Guest LFN (logical file number) maps to our internal slot.
+; Host LFN is what we use with MEGA65 KERNAL (SEQ_LFN_BASE + slot).
+
+; File slot table - 0 = unused, non-zero = guest LFN using this slot
+seq_slot_lfn:     .fill MAX_SEQ_FILES, 0    ; Guest LFN for each slot
+seq_slot_dev:     .fill MAX_SEQ_FILES, 0    ; Device number
+seq_slot_sa:      .fill MAX_SEQ_FILES, 0    ; Secondary address
+seq_slot_status:  .fill MAX_SEQ_FILES, 0    ; Status (EOF, error flags)
+seq_slot_open:    .fill MAX_SEQ_FILES, 0    ; 1 if slot is open on host
+
+; Current I/O channel state
+seq_input_slot:   .byte $FF             ; Current input slot ($FF = none/keyboard)
+seq_output_slot:  .byte $FF             ; Current output slot ($FF = none/screen)
+
+; Temp storage for filename during OPEN
+seq_filename:     .fill 17, 0           ; Filename buffer for sequential files
+seq_filename_len: .byte 0
+
+; ------------------------------------------------------------
 ; P4HOOK_CheckAndRun
 ;   Called once per emulated instruction, right before opcode fetch.
 ; ------------------------------------------------------------
@@ -137,7 +165,7 @@ P4HOOK_CheckAndRun:
 
         lda p4_pc_hi
 
-        ; ----- Check for $FFxx addresses (SETNAM, SETLFS, SAVE, LOAD) -----
+        ; ----- Check for $FFxx addresses (KERNAL calls) -----
         cmp #$FF
         bne _not_ff
         lda p4_pc_lo
@@ -149,6 +177,23 @@ P4HOOK_CheckAndRun:
         beq _do_save
         cmp #$D5                        ; LOAD = $FFD5
         beq _do_load_direct
+        ; Sequential file I/O hooks
+        cmp #$C0                        ; OPEN = $FFC0
+        beq _do_open
+        cmp #$C3                        ; CLOSE = $FFC3
+        beq _do_close
+        cmp #$C6                        ; CHKIN = $FFC6
+        beq _do_chkin
+        cmp #$C9                        ; CHKOUT = $FFC9
+        beq _do_chkout
+        cmp #$CC                        ; CLRCHN = $FFCC
+        beq _do_clrchn
+        cmp #$CF                        ; CHRIN = $FFCF
+        beq _do_chrin
+        cmp #$D2                        ; CHROUT = $FFD2
+        beq _do_chrout
+        cmp #$E4                        ; GETIN = $FFE4
+        beq _do_getin
         jmp _check_other
 
 _do_setnam:
@@ -161,6 +206,38 @@ _do_setlfs:
 
 _do_save:
         jsr P4HOOK_OnSAVE
+        jmp _done
+
+_do_open:
+        jsr P4HOOK_OnOPEN
+        jmp _done
+
+_do_close:
+        jsr P4HOOK_OnCLOSE
+        jmp _done
+
+_do_chkin:
+        jsr P4HOOK_OnCHKIN
+        jmp _done
+
+_do_chkout:
+        jsr P4HOOK_OnCHKOUT
+        jmp _done
+
+_do_clrchn:
+        jsr P4HOOK_OnCLRCHN
+        jmp _done
+
+_do_chrin:
+        jsr P4HOOK_OnCHRIN
+        jmp _done
+
+_do_chrout:
+        jsr P4HOOK_OnCHROUT
+        jmp _done
+
+_do_getin:
+        jsr P4HOOK_OnGETIN
         jmp _done
 
 _do_load_direct:
@@ -570,6 +647,7 @@ P4HOOK_DoHostLoad:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
+        jsr P4MEM_InitVideo             ; Restore video after host KERNAL calls
         jmp _dhl_do_load_after_header
 
 _dhl_header_error:
@@ -577,6 +655,7 @@ _dhl_header_chkin_error:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
+        jsr P4MEM_InitVideo             ; Restore video after host KERNAL calls
         jmp _dhl_error_set
 
 _dhl_do_load_after_header:
@@ -603,16 +682,18 @@ _dhl_do_load:
         ldx #<P4_DIR_BUF
         ldy #>P4_DIR_BUF
         jsr LOAD
+        ; Save end address from LOAD (in X/Y) BEFORE calling InitVideo
+        stx p4_fl_end_lo
+        sty p4_fl_end_hi
+        php                             ; Save carry (error flag)
+        jsr P4MEM_InitVideo             ; Restore video after host KERNAL call
+        plp                             ; Restore carry
         bcc _dhl_load_ok
         
         ; Load failed
         jmp _dhl_error_set
 
 _dhl_load_ok:
-        ; Save end address from LOAD (in X/Y)
-        stx p4_fl_end_lo
-        sty p4_fl_end_hi
-        
         ; Print "LOADING" message
         lda #<P4Host_Msg_Loading
         ldx #>P4Host_Msg_Loading
@@ -921,6 +1002,7 @@ _save_loop_done:
         jsr CLRCHN
         lda #$01
         jsr CLOSE
+        jsr P4MEM_InitVideo             ; Restore video after host KERNAL calls
         
         jmp _dhs_ok
 
@@ -929,6 +1011,7 @@ _dhs_chkout_error:
         jsr CLRCHN
         lda #$01
         jsr CLOSE
+        jsr P4MEM_InitVideo             ; Restore video after host KERNAL calls
         jmp _dhs_error
 
 _dhs_ok:
@@ -1236,6 +1319,10 @@ P4HOOK_OnDIRECTORY:
         ; and fall back to $00 if needed on the host filesystem.
         ; ------------------------------------------------------------
 
+        ; Reset any stale bitmap mode flags to prevent graphics glitch
+        lda #0
+        sta p4_gfx_dirty
+        
         ; Ensure host KERNAL I/O uses bank 0
         lda #$00
         ldx #$00
@@ -1485,6 +1572,9 @@ _dir_done:
         lda #$02
         jsr P4_CLOSE
 
+        ; Re-unlock VIC-IV after file operations (don't reset video mode)
+        jsr P4HOOK_UnlockVIC
+        
         ; Return to BASIC via RTS
         jsr P4HOOK_RTS_Guest
         rts
@@ -1494,6 +1584,7 @@ _tmplinectr:
 
 _dir_open_fail:
         ; Couldn't open directory channel. Just return to BASIC.
+        jsr P4HOOK_UnlockVIC
         jsr P4HOOK_RTS_Guest
         rts
 
@@ -1752,3 +1843,656 @@ P4HOOK_RTS_Guest:
         adc #$00
         sta p4_pc_hi
         rts
+
+
+; ============================================================
+; Sequential File I/O Handlers
+; ============================================================
+; These routines intercept OPEN, CLOSE, CHKIN, CHKOUT, CLRCHN,
+; CHRIN, and CHROUT to provide sequential file access to the
+; SD card through the host MEGA65 KERNAL.
+;
+; Only device 8 (disk) is intercepted. Other devices (keyboard,
+; screen, serial, etc.) are passed through to the Plus/4 ROM.
+; ============================================================
+
+
+; ============================================================
+; VIC State Save/Restore for Host KERNAL Calls
+; ============================================================
+; The MEGA65 host KERNAL can change VIC-IV registers during file
+; operations. We reinitialize video state after each call.
+
+P4HOOK_SaveVIC:
+        rts
+
+P4HOOK_RestoreVIC:
+        jsr P4MEM_InitVideo
+        rts
+
+; Lighter version - just re-unlock VIC-IV without changing mode
+; Use this when we want to preserve graphics mode
+P4HOOK_UnlockVIC:
+        ; Re-unlock VIC-III
+        lda #$A5
+        sta $D02F
+        lda #$96
+        sta $D02F
+        ; Re-unlock VIC-IV
+        lda #$47
+        sta $D02F
+        lda #$53
+        sta $D02F
+        rts
+
+
+; ============================================================
+; P4HOOK_OnOPEN - Handle OPEN command
+; 
+; Guest state on entry:
+;   SETLFS has set: $AC=LFN, $AD=SA, $AE=device
+;   SETNAM has set: $AB=namelen, $AF/$B0=nameptr
+;
+; We intercept device 8 only. Other devices fall through to ROM.
+; ============================================================
+P4HOOK_OnOPEN:
+        ; Check if this is device 8
+        lda LOW_RAM_BUFFER + $AE        ; Device number
+        cmp #$08
+        beq _open_disk
+        ; Not disk - let ROM handle it
+        rts
+
+_open_disk:
+        ; Reset stale graphics flags before file operations
+        lda #0
+        sta p4_gfx_dirty
+        
+        ; Check filename length - need at least 1 char
+        lda LOW_RAM_BUFFER + $AB
+        beq _open_error_no_file
+        cmp #17
+        bcs _open_error_no_file
+        sta seq_filename_len
+        
+        ; Get guest LFN
+        lda LOW_RAM_BUFFER + $AC        ; Logical file number
+        beq _open_error_no_file         ; LFN 0 is invalid
+        sta _open_guest_lfn
+        
+        ; Find a free slot
+        ldx #0
+_open_find_slot:
+        lda seq_slot_lfn,x
+        beq _open_found_slot            ; Empty slot
+        cmp _open_guest_lfn             ; Already open with this LFN?
+        beq _open_error_file_open
+        inx
+        cpx #MAX_SEQ_FILES
+        bcc _open_find_slot
+        ; No free slots
+        jmp _open_error_no_file
+
+_open_found_slot:
+        stx _open_slot                  ; Save slot number
+        
+        ; Copy filename from guest RAM to our buffer
+        ; Filename pointer is at $AF/$B0 in low RAM
+        ; The filename might be in low RAM (<$1000) or in bank 5 (>=$1000)
+        lda LOW_RAM_BUFFER + $B0        ; High byte of pointer
+        cmp #$10
+        bcs _open_copy_bank5            ; >= $1000, use bank 5
+        
+        ; Filename is in low RAM - read from LOW_RAM_BUFFER
+        lda LOW_RAM_BUFFER + $AF
+        sta $FB
+        clc
+        lda LOW_RAM_BUFFER + $B0
+        adc #>LOW_RAM_BUFFER            ; Add $A0
+        sta $FC
+        
+        ldy #0
+_open_copy_low:
+        cpy seq_filename_len
+        beq _open_copy_done
+        lda ($FB),y
+        sta seq_filename,y
+        iny
+        cpy #17
+        bcc _open_copy_low
+        bra _open_copy_done
+
+_open_copy_bank5:
+        ; Filename is in bank 5 (RAM under ROM or higher RAM)
+        lda LOW_RAM_BUFFER + $AF
+        sta P4_MEM_PTR
+        lda LOW_RAM_BUFFER + $B0
+        sta P4_MEM_PTR+1
+        lda #BANK_RAM
+        sta P4_MEM_PTR+2
+        lda #$00
+        sta P4_MEM_PTR+3
+        
+        ldy #0
+_open_copy_b5_loop:
+        cpy seq_filename_len
+        beq _open_copy_done
+        tya
+        taz
+        lda [P4_MEM_PTR],z
+        sta seq_filename,y
+        iny
+        cpy #17
+        bcc _open_copy_b5_loop
+        
+_open_copy_done:
+        lda #0
+        sta seq_filename,y              ; Null terminate
+        
+        ; Set up host KERNAL
+        lda #$00
+        ldx #$00
+        jsr SETBNK
+        
+        ; Set filename for host
+        ldx #<seq_filename
+        ldy #>seq_filename
+        lda seq_filename_len
+        jsr SETNAM
+        
+        ; Calculate host LFN = SEQ_LFN_BASE + slot
+        lda _open_slot
+        clc
+        adc #SEQ_LFN_BASE
+        sta _open_host_lfn
+        
+        ; SETLFS for host: host_lfn, device 8, guest SA
+        lda _open_host_lfn
+        ldx #$08
+        ldy LOW_RAM_BUFFER + $AD        ; Secondary address from guest
+        jsr SETLFS
+        
+        ; Save VIC state before host KERNAL call
+        jsr P4HOOK_SaveVIC
+        
+        ; Call host OPEN
+        jsr OPEN
+        php                             ; Save carry (error flag)
+        
+        ; Restore VIC state after host call
+        jsr P4HOOK_RestoreVIC
+        
+        plp                             ; Restore carry
+        bcs _open_error_host
+        
+        ; Success - record in slot table
+        ldx _open_slot
+        lda _open_guest_lfn
+        sta seq_slot_lfn,x
+        lda #$08
+        sta seq_slot_dev,x
+        lda LOW_RAM_BUFFER + $AD
+        sta seq_slot_sa,x
+        lda #0
+        sta seq_slot_status,x
+        lda #1
+        sta seq_slot_open,x
+        
+        ; Set success status in guest
+        lda #$00
+        sta LOW_RAM_BUFFER + $90        ; Clear status
+        lda p4_p
+        and #((~P_C) & $FF)             ; Clear carry
+        sta p4_p
+        
+        ; Return via RTS to guest
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_open_error_host:
+        ; Host OPEN failed - close and report error
+        lda _open_host_lfn
+        jsr CLOSE
+        jmp _open_error_no_file
+
+_open_error_file_open:
+        lda #$02                        ; FILE ALREADY OPEN
+        jmp _open_set_error
+
+_open_error_no_file:
+        lda #$04                        ; FILE NOT FOUND
+        
+_open_set_error:
+        sta p4_a
+        sta LOW_RAM_BUFFER + $90        ; Set status
+        lda p4_p
+        ora #P_C                        ; Set carry
+        sta p4_p
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_open_guest_lfn: .byte 0
+_open_host_lfn:  .byte 0
+_open_slot:      .byte 0
+
+
+; ============================================================
+; P4HOOK_OnCLOSE - Handle CLOSE command
+;
+; Guest A register contains LFN to close
+; ============================================================
+P4HOOK_OnCLOSE:
+        ; Get LFN from guest A
+        lda p4_a
+        sta _close_lfn
+        
+        ; Find slot with this LFN
+        ldx #0
+_close_find:
+        lda seq_slot_lfn,x
+        cmp _close_lfn
+        beq _close_found
+        inx
+        cpx #MAX_SEQ_FILES
+        bcc _close_find
+        ; Not found in our table - let ROM handle (might be non-disk)
+        rts
+
+_close_found:
+        stx _close_slot
+        
+        ; Check if it's actually open
+        lda seq_slot_open,x
+        beq _close_not_open
+        
+        ; Save VIC state before host KERNAL call
+        jsr P4HOOK_SaveVIC
+        
+        ; Clear host channels before closing
+        jsr CLRCHN
+        
+        ; Close on host
+        lda _close_slot
+        clc
+        adc #SEQ_LFN_BASE
+        jsr CLOSE
+        
+        ; Restore VIC state after host call
+        jsr P4HOOK_RestoreVIC
+        
+        ; Clear slot
+        ldx _close_slot
+        lda #0
+        sta seq_slot_lfn,x
+        sta seq_slot_open,x
+        sta seq_slot_status,x
+        
+        ; If this was current input/output, clear that too
+        cpx seq_input_slot
+        bne +
+        lda #$FF
+        sta seq_input_slot
++       cpx seq_output_slot
+        bne +
+        lda #$FF
+        sta seq_output_slot
++
+_close_not_open:
+        ; Success
+        lda p4_p
+        and #((~P_C) & $FF)
+        sta p4_p
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_close_lfn:  .byte 0
+_close_slot: .byte 0
+
+
+; ============================================================
+; P4HOOK_OnCHKIN - Set input channel
+;
+; Guest X register contains LFN
+; ============================================================
+P4HOOK_OnCHKIN:
+        ; Get LFN from guest X
+        lda p4_x
+        sta _chkin_lfn
+        
+        ; Find slot with this LFN
+        ldx #0
+_chkin_find:
+        lda seq_slot_lfn,x
+        cmp _chkin_lfn
+        beq _chkin_found
+        inx
+        cpx #MAX_SEQ_FILES
+        bcc _chkin_find
+        ; Not in our table - let ROM handle
+        rts
+
+_chkin_found:
+        ; Check if open
+        lda seq_slot_open,x
+        beq _chkin_not_open
+        
+        ; Set as current input
+        stx seq_input_slot
+        
+        ; Also set on host side
+        txa
+        clc
+        adc #SEQ_LFN_BASE
+        tax
+        jsr CHKIN
+        
+        ; Success
+        lda p4_p
+        and #((~P_C) & $FF)
+        sta p4_p
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_chkin_not_open:
+        ; File not open error
+        lda #$03
+        sta p4_a
+        sta LOW_RAM_BUFFER + $90
+        lda p4_p
+        ora #P_C
+        sta p4_p
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_chkin_lfn: .byte 0
+
+
+; ============================================================
+; P4HOOK_OnCHKOUT - Set output channel
+;
+; Guest X register contains LFN
+; ============================================================
+P4HOOK_OnCHKOUT:
+        ; Get LFN from guest X
+        lda p4_x
+        sta _chkout_lfn
+        
+        ; LFN 0 = screen (let ROM handle)
+        beq _chkout_rom
+        
+        ; Find slot with this LFN
+        ldx #0
+_chkout_find:
+        lda seq_slot_lfn,x
+        cmp _chkout_lfn
+        beq _chkout_found
+        inx
+        cpx #MAX_SEQ_FILES
+        bcc _chkout_find
+        ; Not in our table - let ROM handle
+_chkout_rom:
+        rts
+
+_chkout_found:
+        ; Check if open
+        lda seq_slot_open,x
+        beq _chkout_not_open
+        
+        ; Set as current output
+        stx seq_output_slot
+        
+        ; Also set on host side
+        txa
+        clc
+        adc #SEQ_LFN_BASE
+        tax
+        jsr CHKOUT
+        
+        ; Success
+        lda p4_p
+        and #((~P_C) & $FF)
+        sta p4_p
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_chkout_not_open:
+        ; File not open error
+        lda #$03
+        sta p4_a
+        sta LOW_RAM_BUFFER + $90
+        lda p4_p
+        ora #P_C
+        sta p4_p
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_chkout_lfn: .byte 0
+
+
+; ============================================================
+; P4HOOK_OnCLRCHN - Clear channels (reset to keyboard/screen)
+; ============================================================
+P4HOOK_OnCLRCHN:
+        ; Check if we have any active channels
+        lda seq_input_slot
+        cmp #$FF
+        beq _clrchn_check_out
+        ; We had input channel - clear on host too
+        jsr CLRCHN
+
+_clrchn_check_out:
+        ; Clear our tracking
+        lda #$FF
+        sta seq_input_slot
+        sta seq_output_slot
+        
+        ; Let ROM also run to reset its state
+        rts
+
+
+; ============================================================
+; P4HOOK_OnCHRIN - Character input
+;
+; If input is from a file we manage, read from host.
+; Otherwise let ROM handle (keyboard input).
+; ============================================================
+P4HOOK_OnCHRIN:
+        ; Check if we have an active input channel
+        lda seq_input_slot
+        cmp #$FF
+        beq _chrin_rom                  ; No file input - let ROM handle
+        
+        ; Reset stale graphics flags before file operations
+        lda #0
+        sta p4_gfx_dirty
+        
+        ; We're reading from a file
+        ldx seq_input_slot
+        
+        ; Check status - if EOF already, return with status
+        lda seq_slot_status,x
+        and #$40                        ; EOF flag
+        bne _chrin_eof
+        
+        ; Save VIC state before host KERNAL call
+        jsr P4HOOK_SaveVIC
+        
+        ; Read from host
+        jsr CHRIN
+        sta _chrin_byte
+        
+        ; Restore VIC state after host KERNAL call
+        jsr P4HOOK_RestoreVIC
+        
+        ; Check host status
+        jsr READST
+        sta _chrin_status
+        
+        ; Update our status
+        ldx seq_input_slot
+        ora seq_slot_status,x
+        sta seq_slot_status,x
+        
+        ; Also update guest status byte
+        sta LOW_RAM_BUFFER + $90
+        
+        ; Return the byte in guest A
+        lda _chrin_byte
+        sta p4_a
+        
+        ; Clear carry for success
+        lda p4_p
+        and #((~P_C) & $FF)
+        sta p4_p
+        
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_chrin_eof:
+        ; Already at EOF - return 0 with status
+        lda #$00
+        sta p4_a
+        lda #$40
+        sta LOW_RAM_BUFFER + $90
+        lda p4_p
+        and #((~P_C) & $FF)
+        sta p4_p
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_chrin_rom:
+        ; Let ROM handle keyboard input
+        rts
+
+_chrin_byte:   .byte 0
+_chrin_status: .byte 0
+
+
+; ============================================================
+; P4HOOK_OnCHROUT - Character output
+;
+; If output is to a file we manage, write to host.
+; Otherwise let ROM handle (screen output).
+; ============================================================
+P4HOOK_OnCHROUT:
+        ; Check if we have an active output channel to a file
+        lda seq_output_slot
+        cmp #$FF
+        beq _chrout_rom                 ; No file output - let ROM handle
+        
+        ; Reset stale graphics flags before file operations
+        lda #0
+        sta p4_gfx_dirty
+        
+        ; Save VIC state before host KERNAL call
+        jsr P4HOOK_SaveVIC
+        
+        ; We're writing to a file
+        ; Get byte from guest A
+        lda p4_a
+        
+        ; Write to host
+        jsr CHROUT
+        
+        ; Restore VIC state after host call
+        jsr P4HOOK_RestoreVIC
+        
+        ; Check status
+        jsr READST
+        ldx seq_output_slot
+        ora seq_slot_status,x
+        sta seq_slot_status,x
+        sta LOW_RAM_BUFFER + $90
+        
+        ; Clear carry for success
+        lda p4_p
+        and #((~P_C) & $FF)
+        sta p4_p
+        
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_chrout_rom:
+        ; Let ROM handle screen output
+        rts
+
+
+; ============================================================
+; P4HOOK_OnGETIN - Get character input (used by GET#)
+;
+; If input is from a file we manage, read from host.
+; Otherwise let ROM handle (keyboard input).
+;
+; GETIN differs from CHRIN in that it's non-blocking for keyboard
+; and returns 0 if no key is pressed. For files, it works the same.
+; ============================================================
+P4HOOK_OnGETIN:
+        ; Check if we have an active input channel
+        lda seq_input_slot
+        cmp #$FF
+        beq _getin_rom                  ; No file input - let ROM handle keyboard
+        
+        ; Reset stale graphics flags before file operations
+        lda #0
+        sta p4_gfx_dirty
+        
+        ; We're reading from a file - same as CHRIN
+        ldx seq_input_slot
+        
+        ; Check status - if EOF already, return 0 with status
+        lda seq_slot_status,x
+        and #$40                        ; EOF flag
+        bne _getin_eof
+        
+        ; Save VIC state before host KERNAL call
+        jsr P4HOOK_SaveVIC
+        
+        ; Read from host using CHRIN (GETIN uses same mechanism for files)
+        jsr CHRIN
+        sta _getin_byte
+        
+        ; Restore VIC state after host KERNAL call
+        jsr P4HOOK_RestoreVIC
+        
+        ; Check host status
+        jsr READST
+        sta _getin_status
+        
+        ; Update our status
+        ldx seq_input_slot
+        ora seq_slot_status,x
+        sta seq_slot_status,x
+        
+        ; Also update guest status byte
+        sta LOW_RAM_BUFFER + $90
+        
+        ; Return the byte in guest A
+        lda _getin_byte
+        sta p4_a
+        
+        ; Clear carry for success
+        lda p4_p
+        and #((~P_C) & $FF)
+        sta p4_p
+        
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_getin_eof:
+        ; Already at EOF - return 0 with status
+        lda #$00
+        sta p4_a
+        lda #$40
+        sta LOW_RAM_BUFFER + $90
+        lda p4_p
+        and #((~P_C) & $FF)
+        sta p4_p
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_getin_rom:
+        ; Let ROM handle keyboard input
+        rts
+
+_getin_byte:   .byte 0
+_getin_status: .byte 0
