@@ -517,6 +517,7 @@ _dhl_header_chkin_error:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
+        jsr P4MEM_InitVideo
         jmp _dhl_error_set
 
 _dhl_do_load_after_header:
@@ -545,6 +546,10 @@ _dhl_do_load:
         jsr LOAD
         bcc _dhl_load_ok
         
+        ; Load failed - restore video state
+        jsr P4MEM_InitVideo             ; <-- ADD THIS LINE
+        
+
         ; Load failed
         jmp _dhl_error_set
 

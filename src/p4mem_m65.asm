@@ -1402,29 +1402,17 @@ _host_set:
 ; Video mode switching
 ; ============================================================
 P4VID_GfxConfigChanged:
-        ; If GRAPHIC 2 mode (bit 6 of $0083 set), always stay in bitmap mode
-        ; This prevents the Plus/4's split screen IRQ from toggling our display
-        lda LOW_RAM_BUFFER + $83
-        and #$40                ; Check bit 6 (split screen flag)
-        beq _gfx_check_normal   ; Not GRAPHIC 2, handle normally
-        
-        ; GRAPHIC 2 mode - force bitmap mode, ignore TED $FF06 toggling
-        lda ted_regs+$06
-        and #$20
-        beq _gfx_g2_done        ; If Plus/4 switched to text phase, just ignore it
-        
-        ; Plus/4 is in bitmap phase - update if needed
-        lda p4_video_mode
-        bne _gfx_g2_done        ; Already in bitmap mode
-        bra _gfx_enter_bitmap   ; Enter bitmap mode
-        
-_gfx_g2_done:
-        rts
 
-_gfx_check_normal:
+        ; Check TED $FF06 bit 5 for bitmap mode
         lda ted_regs+$06
         and #$20                ; Check bitmap mode bit (bit 5)
         beq _gfx_to_text
+        
+        ; Bitmap bit is set - but only enter if also confirmed by $FF12
+        ; Real GRAPHIC mode sets both $FF06 bit 5 AND $FF12 bits appropriately
+        lda ted_regs+$12
+        and #$38                ; Bitmap address bits
+        beq _gfx_to_text        ; If zero, probably not real graphics mode
 
 _gfx_enter_bitmap:
         ; Enter bitmap mode - determine if multicolor
@@ -1456,12 +1444,15 @@ _gfx_setup_bmp:
         rts
 
 _gfx_to_text:
+        lda p4_video_mode
+        beq _gfx_already_text   ; Already in text mode, skip
         lda #0
         sta p4_video_mode
-        sta p4_multicolor       ; Clear multicolor flag too
+        sta p4_multicolor
         lda #1
         sta p4_gfx_dirty
         jsr P4VID_DisableHostBitmap
+_gfx_already_text:
         rts
 
 ; ============================================================
@@ -1606,6 +1597,7 @@ _pf_done:
 ; P4VID_EnableHostBitmap
 ; ============================================================
 P4VID_EnableHostBitmap:
+
         ; Check if we need to do initial setup
         lda p4_host_bmp_on
         bne _update_mcm_only
