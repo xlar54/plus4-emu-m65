@@ -39,6 +39,9 @@ P_U = %00100000
 P_V = %01000000
 P_N = %10000000
 
+
+p4_kbd_sel:          .byte $FF  ; Keyboard selector written to $FD30
+
 ; TED timing constants (PAL)
 TED_CYCLES_PER_LINE = 57    ; ~57 cycles per scanline
 TED_LINES_PER_FRAME = 312   ; PAL has 312 lines
