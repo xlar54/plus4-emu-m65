@@ -34,7 +34,7 @@ P4_READST               = $FFB7         ; READST
 ; OPEN, CLOSE, CHKIN, CHKOUT, CLRCHN, CHRIN, CHROUT, READST
 
 ; Sequential file I/O constants
-MAX_SEQ_FILES           = 4             ; Maximum simultaneous open files
+MAX_SEQ_FILES           = 10            ; Maximum simultaneous open files (matches Plus/4 KERNAL)
 SEQ_LFN_BASE            = 10            ; Host logical file numbers start here
 
 ; Inside BASIC LOAD handler: the JSR $FFD5 instruction
@@ -131,14 +131,14 @@ p4_monitor_load:  .byte 0
 ; ------------------------------------------------------------
 ; Sequential File I/O Variables
 ; ------------------------------------------------------------
-; We support up to MAX_SEQ_FILES (4) simultaneous open files.
+; We support up to MAX_SEQ_FILES (10) simultaneous open files.
 ; Each slot tracks: guest LFN, device, SA, host LFN, status
 ;
 ; Guest LFN (logical file number) maps to our internal slot.
 ; Host LFN is what we use with MEGA65 KERNAL (SEQ_LFN_BASE + slot).
 
-; File slot table - 0 = unused, non-zero = guest LFN using this slot
-seq_slot_lfn:     .fill MAX_SEQ_FILES, 0    ; Guest LFN for each slot
+; File slot table - $FF = unused, other values = guest LFN using this slot
+seq_slot_lfn:     .fill MAX_SEQ_FILES, $FF   ; Guest LFN for each slot ($FF = unused)
 seq_slot_dev:     .fill MAX_SEQ_FILES, 0    ; Device number
 seq_slot_sa:      .fill MAX_SEQ_FILES, 0    ; Secondary address
 seq_slot_status:  .fill MAX_SEQ_FILES, 0    ; Status (EOF, error flags)
@@ -455,6 +455,16 @@ _load_no_setnam_rts:
         rts
 
 _load_directory:
+        ; Check device number - only intercept device 8 (disk)
+        lda p4_setlfs_dev
+        cmp #$08
+        beq _load_dir_disk
+        ; Not device 8 - let ROM handle
+        lda #0
+        sta p4_setnam_valid
+        rts
+        
+_load_dir_disk:
         ; Clear the valid flag
         lda #0
         sta p4_setnam_valid
@@ -477,6 +487,17 @@ _load_directory:
         rts
 
 _load_file:
+        ; Check device number - only intercept device 8 (disk)
+        lda p4_setlfs_dev
+        cmp #$08
+        beq _load_file_disk
+        ; Not device 8 - let ROM handle (tape, or no device specified)
+        ; Clear the valid flag first
+        lda #0
+        sta p4_setnam_valid
+        rts
+        
+_load_file_disk:
         ; Clear the valid flag
         lda #0
         sta p4_setnam_valid
@@ -539,6 +560,31 @@ P4HOOK_CopyFilename:
         bcs _cf_error                   ; Too long
         sta p4_fl_len
         
+        ; Check if filename is in low RAM ($0000-$0FFF) or bank 5 ($1000+)
+        lda p4_setnam_ptr_hi
+        cmp #$10
+        bcs _cf_bank5                   ; >= $1000, use bank 5
+        
+        ; Filename is in low RAM - read from LOW_RAM_BUFFER
+        lda p4_setnam_ptr_lo
+        sta $FB
+        clc
+        lda p4_setnam_ptr_hi
+        adc #>LOW_RAM_BUFFER            ; Add $A0
+        sta $FC
+        
+        ldy #0
+_cf_low_loop:
+        cpy p4_fl_len
+        beq _cf_done
+        lda ($FB),y
+        sta p4_fl_buf,y
+        iny
+        cpy #17
+        bcc _cf_low_loop
+        bra _cf_done
+        
+_cf_bank5:
         ; Set up 32-bit pointer to read from Bank 5 (guest RAM)
         ; P4_MEM_PTR is at $F0-$F3
         lda p4_setnam_ptr_lo
@@ -603,6 +649,10 @@ p4_prg_header_lo: .byte 0
 p4_prg_header_hi: .byte 0
 
 P4HOOK_DoHostLoad:
+        ; Mark file operation in progress (prevents video mode switching)
+        lda #1
+        sta p4_file_op_active
+        
         ; Set up host KERNAL for file operations
         lda #$00
         ldx #$00
@@ -647,7 +697,7 @@ P4HOOK_DoHostLoad:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
-        jsr P4MEM_InitVideo             ; Restore video after host KERNAL calls
+        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
         jmp _dhl_do_load_after_header
 
 _dhl_header_error:
@@ -655,7 +705,7 @@ _dhl_header_chkin_error:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
-        jsr P4MEM_InitVideo             ; Restore video after host KERNAL calls
+        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
         jmp _dhl_error_set
 
 _dhl_do_load_after_header:
@@ -682,11 +732,11 @@ _dhl_do_load:
         ldx #<P4_DIR_BUF
         ldy #>P4_DIR_BUF
         jsr LOAD
-        ; Save end address from LOAD (in X/Y) BEFORE calling InitVideo
+        ; Save end address from LOAD (in X/Y) BEFORE calling UnlockVIC
         stx p4_fl_end_lo
         sty p4_fl_end_hi
         php                             ; Save carry (error flag)
-        jsr P4MEM_InitVideo             ; Restore video after host KERNAL call
+        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
         plp                             ; Restore carry
         bcc _dhl_load_ok
         
@@ -769,6 +819,10 @@ _dhl_error_set:
         sta p4_a
 
 _dhl_set_pc:
+        ; Clear file operation flag - allow video mode switching again
+        lda #0
+        sta p4_file_op_active
+        
         ; Check if this was a monitor load
         lda p4_monitor_load
         beq _dhl_basic_return
@@ -801,6 +855,14 @@ _dhl_basic_return:
 ; End address is the first byte NOT to save (exclusive).
 ; ============================================================
 P4HOOK_OnSAVE:
+        ; Check device number - only intercept device 8 (disk)
+        lda p4_setlfs_dev
+        cmp #$08
+        beq _save_check_setnam
+        ; Not device 8 - let ROM handle (tape, or no device specified)
+        rts
+        
+_save_check_setnam:
         ; Check if we have valid SETNAM data
         lda p4_setnam_valid
         bne _save_have_setnam
@@ -886,6 +948,10 @@ _save_error:
 ; P4HOOK_DoHostSave - Save file using host MEGA65 KERNAL
 ; ============================================================
 P4HOOK_DoHostSave:
+        ; Mark file operation in progress (prevents video mode switching)
+        lda #1
+        sta p4_file_op_active
+        
         ; Calculate data length
         lda p4_save_end_lo
         sec
@@ -1002,7 +1068,7 @@ _save_loop_done:
         jsr CLRCHN
         lda #$01
         jsr CLOSE
-        jsr P4MEM_InitVideo             ; Restore video after host KERNAL calls
+        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
         
         jmp _dhs_ok
 
@@ -1011,7 +1077,7 @@ _dhs_chkout_error:
         jsr CLRCHN
         lda #$01
         jsr CLOSE
-        jsr P4MEM_InitVideo             ; Restore video after host KERNAL calls
+        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
         jmp _dhs_error
 
 _dhs_ok:
@@ -1028,12 +1094,19 @@ _dhs_ok:
         lda #$00
         sta p4_a
         
+        ; Clear file operation flag - allow video mode switching again
+        lda #0
+        sta p4_file_op_active
+        
         ; We intercepted at $FFD8 (KERNAL SAVE entry)
         ; Pop the return address from guest stack and set PC to return
         jsr P4HOOK_RTS_Guest
         rts
 
 _dhs_error:
+        ; Clear file operation flag even on error
+        lda #0
+        sta p4_file_op_active
         jsr P4HOOK_SaveSetError
         rts
 
@@ -1861,13 +1934,14 @@ P4HOOK_RTS_Guest:
 ; VIC State Save/Restore for Host KERNAL Calls
 ; ============================================================
 ; The MEGA65 host KERNAL can change VIC-IV registers during file
-; operations. We reinitialize video state after each call.
+; operations. We just re-unlock VIC-IV after each call.
 
 P4HOOK_SaveVIC:
         rts
 
 P4HOOK_RestoreVIC:
-        jsr P4MEM_InitVideo
+        ; Just re-unlock VIC-IV, don't reinitialize entire video
+        jsr P4HOOK_UnlockVIC
         rts
 
 ; Lighter version - just re-unlock VIC-IV without changing mode
@@ -1908,23 +1982,32 @@ _open_disk:
         lda #0
         sta p4_gfx_dirty
         
-        ; Check filename length - need at least 1 char
+        ; Check filename length
+        ; Empty filename (length 0) is allowed for command channel reads
         lda LOW_RAM_BUFFER + $AB
-        beq _open_error_no_file
         cmp #17
-        bcs _open_error_no_file
+        bcs _open_error_no_file         ; Filename too long
         sta seq_filename_len
+        bne _open_has_filename          ; Non-empty filename, continue
         
+        ; Empty filename - only allowed for SA >= $0F (command channel)
+        lda LOW_RAM_BUFFER + $AD        ; Secondary address
+        and #$0F
+        cmp #$0F
+        bne _open_error_no_file         ; Empty name but not command channel
+        
+_open_has_filename:
         ; Get guest LFN
         lda LOW_RAM_BUFFER + $AC        ; Logical file number
-        beq _open_error_no_file         ; LFN 0 is invalid
         sta _open_guest_lfn
+        ; Note: LFN 0 is valid for command/error channel reads
         
         ; Find a free slot
         ldx #0
 _open_find_slot:
         lda seq_slot_lfn,x
-        beq _open_found_slot            ; Empty slot
+        cmp #$FF
+        beq _open_found_slot            ; Empty slot ($FF = unused)
         cmp _open_guest_lfn             ; Already open with this LFN?
         beq _open_error_file_open
         inx
@@ -2038,6 +2121,35 @@ _open_copy_done:
         lda #1
         sta seq_slot_open,x
         
+        ; ============================================================
+        ; IMPORTANT: Update Plus/4 KERNAL file tables so ROM knows
+        ; the file is open. Without this, CLOSE will fail with
+        ; "FILE NOT OPEN" error.
+        ;
+        ; Plus/4 file table locations:
+        ;   $97 = LDTND (number of open files, index for next entry)
+        ;   $0509-$0512 = LAT (Logical file numbers) - 10 entries
+        ;   $0513-$051C = FAT (Device numbers) - 10 entries
+        ;   $051D-$0526 = SAT (Secondary addresses) - 10 entries
+        ; ============================================================
+        ldx LOW_RAM_BUFFER + $97        ; Get current file count
+        cpx #10
+        bcs _open_table_full            ; Max 10 files
+        
+        ; Store in Plus/4 tables (these are in low RAM, not ZP)
+        lda _open_guest_lfn
+        sta LOW_RAM_BUFFER + $0509,x    ; LAT[x] = LFN
+        lda #$08
+        sta LOW_RAM_BUFFER + $0513,x    ; FAT[x] = device
+        lda LOW_RAM_BUFFER + $AD        ; SA from SETLFS
+        ora #$60                        ; Set bits 5+6 like KERNAL does
+        sta LOW_RAM_BUFFER + $AD        ; Update SETLFS work area too
+        sta LOW_RAM_BUFFER + $051D,x    ; SAT[x] = secondary address
+        
+        ; Increment file count
+        inc LOW_RAM_BUFFER + $97
+        
+_open_table_full:
         ; Set success status in guest
         lda #$00
         sta LOW_RAM_BUFFER + $90        ; Clear status
@@ -2122,8 +2234,9 @@ _close_found:
         
         ; Clear slot
         ldx _close_slot
+        lda #$FF
+        sta seq_slot_lfn,x              ; $FF = unused
         lda #0
-        sta seq_slot_lfn,x
         sta seq_slot_open,x
         sta seq_slot_status,x
         
@@ -2137,6 +2250,60 @@ _close_found:
         lda #$FF
         sta seq_output_slot
 +
+        ; ============================================================
+        ; Remove entry from Plus/4 KERNAL file tables
+        ; We need to find the entry with matching LFN and remove it
+        ; by shifting all subsequent entries down
+        ;
+        ; Plus/4 file table locations:
+        ;   $97 = LDTND (file count)
+        ;   $0509-$0512 = LAT (Logical file numbers)
+        ;   $0513-$051C = FAT (Device numbers)
+        ;   $051D-$0526 = SAT (Secondary addresses)
+        ; ============================================================
+        ldx #0
+        lda LOW_RAM_BUFFER + $97        ; File count
+        beq _close_table_done           ; No files open
+        
+_close_find_lat:
+        lda LOW_RAM_BUFFER + $0509,x    ; LAT[x]
+        cmp _close_lfn
+        beq _close_found_lat
+        inx
+        cpx LOW_RAM_BUFFER + $97
+        bcc _close_find_lat
+        bra _close_table_done           ; Not found in table
+        
+_close_found_lat:
+        ; Found at index X - shift subsequent entries down
+        ; First decrement file count
+        dec LOW_RAM_BUFFER + $97
+        
+_close_shift_loop:
+        inx
+        cpx LOW_RAM_BUFFER + $97
+        beq _close_copy_last
+        bcs _close_table_done
+        
+        ; Copy entry X to X-1
+        lda LOW_RAM_BUFFER + $0509,x
+        sta LOW_RAM_BUFFER + $0508,x    ; LAT[x-1] = LAT[x]
+        lda LOW_RAM_BUFFER + $0513,x
+        sta LOW_RAM_BUFFER + $0512,x    ; FAT[x-1] = FAT[x]
+        lda LOW_RAM_BUFFER + $051D,x
+        sta LOW_RAM_BUFFER + $051C,x    ; SAT[x-1] = SAT[x]
+        bra _close_shift_loop
+        
+_close_copy_last:
+        ; Copy the last entry
+        lda LOW_RAM_BUFFER + $0509,x
+        sta LOW_RAM_BUFFER + $0508,x
+        lda LOW_RAM_BUFFER + $0513,x
+        sta LOW_RAM_BUFFER + $0512,x
+        lda LOW_RAM_BUFFER + $051D,x
+        sta LOW_RAM_BUFFER + $051C,x
+        
+_close_table_done:
 _close_not_open:
         ; Success
         lda p4_p
