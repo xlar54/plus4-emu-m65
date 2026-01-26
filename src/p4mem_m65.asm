@@ -24,6 +24,9 @@
 ; Bank numbers
 BANK_ROM    = $04                       ; Plus/4 ROMs in bank 4
 BANK_RAM    = $05                       ; Plus/4 RAM in bank 5
+HOST_BUF_BANK = $01                      ; Host-only buffers (bank 1)
+HOST_BMP_SCR  = $0400                    ; 1KB screen-matrix buffer in HOST_BUF_BANK
+HOST_BMP_BASE = $2000                    ; 8000-byte bitmap buffer in HOST_BUF_BANK
 
 ; Memory buffer in bank 0 (host RAM) - only for low RAM now
 LOW_RAM_BUFFER  = $A000                 ; 4KB - Plus/4 low RAM $0000-$0FFF (always resident)
@@ -187,6 +190,10 @@ P4MEM_InitVideo:
         and #$EF                ; Clear MCM bit
         sta $D016
         
+        ; Disable VIC-IV hot register propagation (use VIC-IV pointers only)
+        lda #$80
+        trb $D05D               ; Clear bit 7 (HOTREG)
+
         rts
 
 ; ============================================================
@@ -219,7 +226,7 @@ clear_low_ram_buffer:
         .byte $00                       ; unused
         .byte <LOW_RAM_BUFFER
         .byte >LOW_RAM_BUFFER
-        .byte $00                       ; dest bank 0
+        .byte HOST_BUF_BANK                       ; dest bank 0
         .byte $00
         .word $0000
         rts
@@ -980,10 +987,8 @@ P4VID_SyncCharset:
         sta $D069               ; CHARPTR MSB  
         lda #$02
         sta $D06A               ; CHARPTR bank (bank 2 = $2xxxx)
-        
-        ; Re-enable hot registers
-        lda #$80
-        tsb $D05D               ; Set bit 7 (HOTREG)
+
+        ; HOTREG stays disabled globally (we use VIC-IV pointers directly)
         rts
         
 _sync_ram_charset:
@@ -1057,103 +1062,85 @@ _pf_done:
 ; P4VID_EnableHostBitmap
 ; ============================================================
 P4VID_EnableHostBitmap:
-        ; Check if we need to do initial setup
+        ; VIC-IV only: keep HOTREG disabled so VIC-II regs don't stomp pointers
+        lda #$80
+        trb $D05D               ; Clear bit 7 (HOTREG)
+
+        ; If already enabled, just refresh MCM + colors
         lda p4_host_bmp_on
-        bne _update_mcm_only
-
-        ; === First time bitmap enable - full setup ===
-        
-        ; Save host VIC/CIA2 state
-        lda $DD00
-        sta p4_save_dd00
-        lda $D011
-        sta p4_save_d011
-        lda $D016
-        sta p4_save_d016
-        lda $D018
-        sta p4_save_d018
-        lda $D020
-        sta p4_save_d020
-        lda $D021
-        sta p4_save_d021
-
-        ; Select VIC bank 3 ($C000-$FFFF)
-        lda $DD00
-        and #$FC
-        ora #$00                ; Bank 3
-        sta $DD00
-
-        ; Screen at $CC00, Bitmap at $E000 within bank 3
-        lda #$38
-        sta $D018
-
-        ; Enable bitmap mode in $D011
-        lda $D011
-        ora #$20
-        sta $D011
+        bne _hb_update
 
         ; Mark bitmap as on
         lda #1
         sta p4_host_bmp_on
 
-        ; === Clear host bitmap to white (all 1-bits = foreground color) ===
+        ; Point VIC-IV screen matrix to HOST_BMP_SCR in HOST_BUF_BANK
+        lda #<HOST_BMP_SCR
+        sta $D060               ; SCRNPTR LSB
+        lda #>HOST_BMP_SCR
+        sta $D061               ; SCRNPTR MSB
+        lda #HOST_BUF_BANK
+        sta $D062               ; SCRNPTR bank
+
+        ; Point VIC-IV bitmap base (CHARPTR used as bitmap base in bitmap mode)
+        lda #<HOST_BMP_BASE
+        sta $D068               ; CHARPTR LSB
+        lda #>HOST_BMP_BASE
+        sta $D069               ; CHARPTR MSB
+        lda #HOST_BUF_BANK
+        sta $D06A               ; CHARPTR bank
+
+        ; Enable bitmap mode
+        lda $D011
+        ora #$20                ; BMM
+        sta $D011
+
+        ; Clear host bitmap buffer to 0 so we start with a "clear" bitmap
         lda #$00
         sta $D707
         .byte $80, $00, $81, $00, $00   ; enhanced DMA options
         .byte $03                       ; fill command
         .word $1F40                     ; 8000 bytes
-        .word $FFFF                     ; fill with $FF (white)
+        .word $0000                     ; fill with $00
         .byte $00                       ; source bank (unused)
-        .word $E000                     ; dest address - bitmap
-        .byte $00                       ; dest bank 0
-        .byte $00
-        .word $0000
+        .word HOST_BMP_BASE             ; dest address
+        .byte HOST_BUF_BANK             ; dest bank
+        .byte $00                       ; sub-command
+        .word $0000                     ; modulo
 
-        ; === Fill screen RAM at $CC00 with white-on-black ($10) ===
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00   ; enhanced DMA options
-        .byte $03                       ; fill command
-        .word $03E8                     ; 1000 bytes
-        .word $1010                     ; fill with $10 (white fg, black bg)
-        .byte $00                       ; source bank (unused)
-        .word $CC00                     ; dest address - screen RAM
-        .byte $00                       ; dest bank 0
-        .byte $00
-        .word $0000
-
-        ; Set palette for bitmap mode
-        jsr P4VID_SetBrightTEDPalette16
-
-_update_mcm_only:
-        ; === Update multicolor bit (called every time) ===
-        lda $D016
-        and #$EF                ; Clear MCM bit (bit 4)
-        ldx p4_multicolor
-        beq _mcm_cleared
-        ora #$10                ; Set MCM bit if multicolor mode
-_mcm_cleared:
-        sta $D016
-
-        ; === Set border/background from TED colors ===
-        ; In bitmap mode, VIC-II $D020/$D021 only use 4 bits (0-15)
-        ; So we must map TED 128 colors to C64 16 colors
-        lda ted_regs+$19        ; TED border color
-        and #$7F
-        tax
-        lda ted_to_c64_color,x  ; Map to C64 color (0-15)
-        sta $D020
-        
-        lda ted_regs+$15        ; TED background color
-        and #$7F
-        tax
-        lda ted_to_c64_color,x  ; Map to C64 color (0-15)
-        sta $D021
-
-        ; === Schedule deferred screen fill ===
-        ; Can't do it here (crashes), so do it in P4VID_Frame
+        ; Request screen-matrix fill and a bitmap render
         lda #1
         sta p4_screen_fill_pending
+        sta p4_gfx_dirty
+
+        ; Use a 16-color palette for bitmap mode
+        jsr P4VID_SetBrightTEDPalette16
+
+_hb_update:
+        ; Update multicolor bit
+        lda $D016
+        and #$EF                ; Clear MCM
+        ldx p4_multicolor
+        beq _hb_mcm_done
+        ora #$10                ; Set MCM if multicolor
+_hb_mcm_done:
+        sta $D016
+
+        ; Border/background from TED colors (map to C64 16 colors for safety)
+        lda ted_regs+$19
+        and #$7F
+        tax
+        lda ted_to_c64_color,x
+        and #$0F
+        sta $D020
+
+        lda ted_regs+$15
+        and #$7F
+        tax
+        lda ted_to_c64_color,x
+        and #$0F
+        sta $D021
+
         rts
 
 ; ============================================================
@@ -1192,8 +1179,8 @@ P4VID_DoScreenFill:
 _dsf_fill_byte:
         .word $1010                     ; fill value (patched above)
         .byte $00                       ; source bank (unused for fill)
-        .word $CC00                     ; dest address - screen RAM in bank 3
-        .byte $00                       ; dest bank 0
+        .word HOST_BMP_SCR                     ; dest address - screen RAM in bank 3
+        .byte HOST_BUF_BANK                       ; dest bank 0
         .byte $00                       ; sub-command
         .word $0000                     ; modulo
         rts
@@ -1210,47 +1197,44 @@ _dsf_multicolor:
 P4VID_DisableHostBitmap:
         lda p4_host_bmp_on
         beq _dis_done
-        
-        ; Restore DD00 (preserve IEC bits)
-        lda $DD00
-        and #$FC                ; Keep current IEC state (bits 2-7)
-        sta _dis_temp
-        lda p4_save_dd00
-        and #$03                ; Get saved VIC bank bits only
-        ora _dis_temp
-        sta $DD00
-        
-        ; Restore VIC state
-        lda p4_save_d018
-        sta $D018
-        lda p4_save_d016
-        sta $D016
-        lda p4_save_d011
+
+        ; Leave HOTREG disabled (VIC-IV pointers only)
+        lda #$80
+        trb $D05D
+
+        ; Disable bitmap mode (clear BMM)
+        lda $D011
+        and #$DF
         sta $D011
-        
-        ; Restore border/background from TED registers (use 128-color palette)
-        ; Don't use saved values - those were C64-mapped for bitmap mode
+
+        ; Disable multicolor (clear MCM)
+        lda $D016
+        and #$EF
+        sta $D016
+
+        ; Restore border/background using TED palette indices (0-127)
         lda ted_regs+$19
         and #$7F
         sta $D020
         lda ted_regs+$15
         and #$7F
         sta $D021
-        
-        ; Restore VIC-IV SCRNPTR to text screen location
-        ; Screen is at LOW_RAM_BUFFER + $0C00 = $AC00 in bank 0
+
+        ; Restore VIC-IV screen pointer back to text screen in LOW_RAM_BUFFER ($AC00) bank 0
         lda #$00
-        sta $D060               ; SCRNPTR LSB = $00
+        sta $D060
         lda #$AC
-        sta $D061               ; SCRNPTR middle = $AC
+        sta $D061
         lda #$00
-        sta $D062               ; SCRNPTR bank = 0
-        
+        sta $D062
+
+        ; Restore charset pointer based on current Plus/4 charset selection
+        jsr P4VID_SyncCharset
+
         lda #0
         sta p4_host_bmp_on
 
-        ; Restore full 128-entry TED palette for text mode
-        ; (also restores entries 0..15 back to the standard TED table).
+        ; Restore full TED palette for text mode
         jsr P4VID_InitPalette
 _dis_done:
         rts
@@ -1258,23 +1242,134 @@ _dis_done:
 _dis_temp: .byte 0
 
 ; ============================================================
-; P4VID_RenderHiresBitmap - DMA copy from bank 5 to host bitmap
+; P4VID_RenderHiresBitmap - Convert TED linear bitmap -> VIC interleaved bitmap
+; Source: Plus/4 RAM (BANK_RAM) at (p4_bmp_hi<<8), linear 40 bytes * 200 lines
+; Dest:   HOST_BMP_BASE in HOST_BUF_BANK, VIC bitmap interleaved layout
+; Layout:
+;   For row=0..24 (8 lines each):
+;     For line=0..7:
+;       dst = HOST_BMP_BASE + (row*320) + (line*40)
+;       src = bmp_base     + (row*320)  + (line*40)
 ; ============================================================
 P4VID_RenderHiresBitmap:
-        lda p4_bmp_hi
-        sta _bm_src+1
+        ; If host bitmap not on, nothing to do
+        lda p4_host_bmp_on
+        beq _rb_done
 
+        ; Base source address = (p4_bmp_hi<<8)
         lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $00                       ; copy
-        .word $1F40                     ; 8000 bytes
-_bm_src:
-        .byte $00, $20, BANK_RAM        ; src lo/hi/bank (hi patched)
-        .byte $00, $E0, $00             ; dst lo/hi/bank 0 - bitmap at $E000
-        .byte $00
-        .word $0000
+        sta rb_src_row_lo
+        lda p4_bmp_hi
+        sta rb_src_row_hi
+
+        ; Base dest row address = HOST_BMP_BASE
+        lda #<HOST_BMP_BASE
+        sta rb_dst_row_lo
+        lda #>HOST_BMP_BASE
+        sta rb_dst_row_hi
+
+        ldx #25                 ; 25 character rows (200 lines / 8)
+_rb_row_loop:
+        ; src_line = src_row
+        lda rb_src_row_lo
+        sta rb_src_line_lo
+        lda rb_src_row_hi
+        sta rb_src_line_hi
+
+        ; dst_row is already in rb_dst_row_*
+        ldy #0                  ; line 0..7
+_rb_line_loop:
+        ; Patch DMA list source address (bank BANK_RAM)
+        lda rb_src_line_lo
+        sta _rb_dma_src_lo
+        lda rb_src_line_hi
+        sta _rb_dma_src_hi
+
+        ; Patch DMA list destination address:
+        ; dst = dst_row + (line * 40)
+        clc
+        lda rb_dst_row_lo
+        adc rb_line_add_lo,y
+        sta _rb_dma_dst_lo
+        lda rb_dst_row_hi
+        adc rb_line_add_hi,y
+        sta _rb_dma_dst_hi
+
+        ; Trigger DMA copy of 40 bytes
+        lda #$00
+        sta $D702               ; DMA list bank 0
+        lda #>_rb_dma_list
+        sta $D701
+        lda #<_rb_dma_list
+        sta $D700               ; triggers DMA
+
+        ; Advance src_line by 40 bytes
+        clc
+        lda rb_src_line_lo
+        adc #40
+        sta rb_src_line_lo
+        lda rb_src_line_hi
+        adc #0
+        sta rb_src_line_hi
+
+        iny
+        cpy #8
+        bne _rb_line_loop
+
+        ; Advance src_row by 320 bytes ($0140)
+        clc
+        lda rb_src_row_lo
+        adc #$40
+        sta rb_src_row_lo
+        lda rb_src_row_hi
+        adc #$01
+        sta rb_src_row_hi
+
+        ; Advance dst_row by 320 bytes ($0140)
+        clc
+        lda rb_dst_row_lo
+        adc #$40
+        sta rb_dst_row_lo
+        lda rb_dst_row_hi
+        adc #$01
+        sta rb_dst_row_hi
+
+        dex
+        bne _rb_row_loop
+
+_rb_done:
         rts
+
+; DMA list for one 40-byte copy (patched per line)
+_rb_dma_list:
+        .byte $00               ; copy
+        .word 40                ; count
+_rb_dma_src_lo:
+        .byte $00
+_rb_dma_src_hi:
+        .byte $20
+        .byte BANK_RAM          ; src bank
+_rb_dma_dst_lo:
+        .byte $00
+_rb_dma_dst_hi:
+        .byte $20
+        .byte HOST_BUF_BANK     ; dst bank
+        .byte $00               ; sub-command
+        .word $0000             ; modulo
+
+; Helpers for dst = dst_row + line*40
+rb_line_add_lo:
+        .byte $00,$28,$50,$78,$A0,$C8,$F0,$18
+rb_line_add_hi:
+        .byte $00,$00,$00,$00,$00,$00,$00,$01
+
+; Working vars
+rb_src_row_lo:   .byte 0
+rb_src_row_hi:   .byte 0
+rb_dst_row_lo:   .byte 0
+rb_dst_row_hi:   .byte 0
+rb_src_line_lo:  .byte 0
+rb_src_line_hi:  .byte 0
 
 copy_mc_screen_ram:
         ; Screen RAM provides the FOREGROUND color for %01/%10 pixels
@@ -1308,8 +1403,8 @@ _mc_scr_dmalist:
 _mc_scr_fill:
         .word $0000                     ; fill value (patched above)
         .byte $00                       ; source bank (unused for fill)
-        .word $CC00                     ; Screen RAM at $CC00 in bank 3
-        .byte $00                       ; dest bank 0
+        .word HOST_BMP_SCR                     ; Screen RAM at $CC00 in bank 3
+        .byte HOST_BUF_BANK                       ; dest bank 0
         .byte $00                       ; sub-command (F018B)
         .word $0000                     ; modulo
 

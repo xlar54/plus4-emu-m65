@@ -648,10 +648,17 @@ _cf_error:
 p4_prg_header_lo: .byte 0
 p4_prg_header_hi: .byte 0
 
+; Saved video mode across host file operations (for error recovery)
+p4_prev_video_mode: .byte 0
+
 P4HOOK_DoHostLoad:
         ; Mark file operation in progress (prevents video mode switching)
         lda #1
         sta p4_file_op_active
+
+        ; Remember current Plus/4 video mode (for error recovery)
+        lda p4_video_mode
+        sta p4_prev_video_mode
         
         ; Set up host KERNAL for file operations
         lda #$00
@@ -822,6 +829,9 @@ _dhl_set_pc:
         ; Clear file operation flag - allow video mode switching again
         lda #0
         sta p4_file_op_active
+
+        ; If LOAD failed, force text mode to recover host video state
+        jsr P4HOOK_PostFileOpVideoFix
         
         ; Check if this was a monitor load
         lda p4_monitor_load
@@ -951,6 +961,10 @@ P4HOOK_DoHostSave:
         ; Mark file operation in progress (prevents video mode switching)
         lda #1
         sta p4_file_op_active
+
+        ; Remember current Plus/4 video mode (for error recovery)
+        lda p4_video_mode
+        sta p4_prev_video_mode
         
         ; Calculate data length
         lda p4_save_end_lo
@@ -1097,6 +1111,9 @@ _dhs_ok:
         ; Clear file operation flag - allow video mode switching again
         lda #0
         sta p4_file_op_active
+
+        ; If SAVE failed, force text mode to recover host video state
+        jsr P4HOOK_PostFileOpVideoFix
         
         ; We intercepted at $FFD8 (KERNAL SAVE entry)
         ; Pop the return address from guest stack and set PC to return
@@ -1107,6 +1124,9 @@ _dhs_error:
         ; Clear file operation flag even on error
         lda #0
         sta p4_file_op_active
+
+        ; If SAVE failed, force text mode to recover host video state
+        jsr P4HOOK_PostFileOpVideoFix
         jsr P4HOOK_SaveSetError
         rts
 
@@ -2663,3 +2683,24 @@ _getin_rom:
 
 _getin_byte:   .byte 0
 _getin_status: .byte 0
+
+; ============================================================
+; P4HOOK_PostFileOpVideoFix
+; If the last host file operation set Carry in p4_p (error),
+; force emulator back to text mode. On success, do nothing.
+; This specifically fixes host KERNAL error-path leaving VIC-IV
+; in a different mode after ?FILE NOT FOUND, etc.
+; ============================================================
+P4HOOK_PostFileOpVideoFix:
+        lda p4_p
+        and #P_C
+        beq _pfov_done
+
+        ; Error: force text mode
+        lda #0
+        sta p4_video_mode
+        jsr P4VID_DisableHostBitmap
+        jsr P4MEM_InitVideo
+
+_pfov_done:
+        rts
