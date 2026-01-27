@@ -2,7 +2,7 @@
 
 This is a simple Commodore Plus 4 emulator for the Mega65 computer
 
-The latest build is in the Target directory as a d81
+The latest build is in the Target directory as a d81.  It uses 64TASS for the assembler.
 
 You MUST have the plus4 KERNAL ROM and BASIC ROM on the same disk.  The files in particular are:
  * basic.318006-01  (rename to BASIC.BIN on the disk)
