@@ -501,8 +501,26 @@ _load_file_disk:
         ; Clear the valid flag
         lda #0
         sta p4_setnam_valid
-        sta p4_monitor_load             ; Clear monitor flag - this is BASIC load
         
+        ; Check if we were called from the $A800 hook (BASIC) or $FFD5 hook (direct)
+        ; If PC is currently $A800, we're in BASIC path
+        lda p4_pc_hi
+        cmp #$A8
+        bne _lfd_not_basic
+        lda p4_pc_lo
+        bne _lfd_not_basic
+        
+        ; Caller is BASIC (PC = $A800)
+        lda #0
+        sta p4_monitor_load
+        jmp _lfd_continue
+        
+_lfd_not_basic:
+        ; Caller is NOT BASIC - set monitor flag for RTS return
+        lda #1
+        sta p4_monitor_load
+        
+_lfd_continue:
         ; Copy filename from guest RAM to our buffer
         jsr P4HOOK_CopyFilename
         bcs _load_file_error
@@ -531,18 +549,32 @@ _load_do_it:
         rts
 
 _load_file_error:
-        ; Set carry and error code, skip to after JSR
+        ; Set carry and error code
         lda p4_p
         ora #P_C
         sta p4_p
         lda #$04                        ; FILE NOT FOUND
         sta p4_a
+        lda #$42
+        sta LOW_RAM_BUFFER + $90        ; Also set STATUS byte!
+        
+        ; Check if this was a monitor/direct load or BASIC load
+        lda p4_monitor_load
+        beq _lfe_basic
+        
+        ; Monitor/direct load - return via RTS
+        lda #0
+        sta p4_monitor_load
+        jsr P4HOOK_RTS_Guest
+        rts
+        
+_lfe_basic:
+        ; BASIC load - skip to after JSR $FFD5
         lda #<P4HOOK_ROM_AFTER_KERNAL_CALL
         sta p4_pc_lo
         lda #>P4HOOK_ROM_AFTER_KERNAL_CALL
         sta p4_pc_hi
         rts
-
 
 ; ============================================================
 ; P4HOOK_CopyFilename - Copy filename from guest RAM to buffer
@@ -819,11 +851,27 @@ _dhl_do_copy:
         jmp _dhl_set_pc
 
 _dhl_error_set:
+        ; Print appropriate error message based on caller
+        lda p4_monitor_load
+        bne _dhl_error_monitor
+        jmp _dhl_error_set_status
+
+_dhl_error_monitor:
+       ; Since we are bypassing the kernal load routine,
+       ; if its the monitor thats failing to load, we 
+       ; need to print its error message
+        lda #<P4Host_Msg_Monitor_FileNotFound
+        ldx #>P4Host_Msg_Monitor_FileNotFound
+        jsr P4Host_PrintString
+
+_dhl_error_set_status:
         lda p4_p
         ora #P_C
         sta p4_p
-        lda #$04                        ; FILE NOT FOUND error
+        lda #$04                        ; FILE NOT FOUND
         sta p4_a
+        lda #$42
+        sta LOW_RAM_BUFFER + $90        ; set STATUS byte
 
 _dhl_set_pc:
         ; Clear file operation flag - allow video mode switching again
@@ -851,6 +899,10 @@ _dhl_basic_return:
         sta p4_pc_hi
         rts
 
+P4Host_Msg_Monitor_FileNotFound:
+        .byte $0d
+        .text "i/o error #4"
+        .byte $00
 
 ; ============================================================
 ; Hook: SAVE - Handle file saving
@@ -1293,6 +1345,28 @@ P4HOOK_DMACopyFileToGuest:
         lda p4_dir_dest_hi
         sta _dma_fl_dst_hi
 
+        ; --------------------------------------------------------
+        ; FIRST: Sync LOW_RAM_BUFFER -> Bank 5 so any guest writes
+        ; to low RAM are preserved before we potentially overwrite
+        ; --------------------------------------------------------
+        lda #$00
+        sta $D707
+        .byte $80,$00,$81,$00,$00
+        .byte $00                       ; copy
+        .byte $00                       ; len lo = $1000 (4KB)
+        .byte $10                       ; len hi
+        .byte <LOW_RAM_BUFFER           ; src lo
+        .byte >LOW_RAM_BUFFER           ; src hi
+        .byte $00                       ; src bank 0
+        .byte $00                       ; dest lo
+        .byte $00                       ; dest hi  
+        .byte P4_BANK_RAM               ; dest bank 5
+        .byte $00
+        .word $0000
+
+        ; --------------------------------------------------------
+        ; Now DMA the file data to guest RAM (bank 5)
+        ; --------------------------------------------------------
         lda #$00
         sta $D707
         .byte $80,$00,$81,$00,$00
@@ -1311,8 +1385,125 @@ _dma_fl_dst_hi:
         .byte P4_BANK_RAM               ; dest bank 5
         .byte $00
         .word $0000
+
+        ; --------------------------------------------------------
+        ; Check if load destination overlaps LOW_RAM_BUFFER range ($0000-$0FFF)
+        ; If dest_hi >= $10, no overlap - we're done
+        ; --------------------------------------------------------
+        lda p4_dir_dest_hi
+        cmp #$10
+        bcs _dma_fl_done                ; dest >= $1000, no overlap with low RAM
+
+        ; --------------------------------------------------------
+        ; Calculate end of loaded data, clamped to $1000
+        ; --------------------------------------------------------
+        clc
+        lda p4_dir_dest_lo
+        adc p4_dir_len_lo
+        sta _sync_end_lo
+        lda p4_dir_dest_hi
+        adc p4_dir_len_hi
+        sta _sync_end_hi
+        
+        ; Clamp end to $1000 if it exceeds
+        lda _sync_end_hi
+        cmp #$10
+        bcc _sync_calc_range            ; end < $1000, use as-is
+        lda #$00
+        sta _sync_end_lo
+        lda #$10
+        sta _sync_end_hi
+
+_sync_calc_range:
+        ; Calculate start of sync: max(dest, $0200) to skip ZP/stack
+        lda p4_dir_dest_hi
+        bne _sync_start_is_dest         ; dest >= $0100, check further
+        ; dest_hi == 0, so dest < $0100, use $0200 as start
+        lda #$00
+        sta _sync_start_lo
+        lda #$02
+        sta _sync_start_hi
+        jmp _sync_check_range
+        
+_sync_start_is_dest:
+        cmp #$02
+        bcs _sync_use_dest              ; dest >= $0200, use dest as start
+        ; dest is $01xx (in stack area), use $0200
+        lda #$00
+        sta _sync_start_lo
+        lda #$02
+        sta _sync_start_hi
+        jmp _sync_check_range
+        
+_sync_use_dest:
+        lda p4_dir_dest_lo
+        sta _sync_start_lo
+        lda p4_dir_dest_hi
+        sta _sync_start_hi
+
+_sync_check_range:
+        ; If start >= end, nothing to sync
+        lda _sync_start_hi
+        cmp _sync_end_hi
+        bcc _do_sync                    ; start_hi < end_hi, sync needed
+        bne _dma_fl_done                ; start_hi > end_hi, nothing to sync
+        lda _sync_start_lo
+        cmp _sync_end_lo
+        bcs _dma_fl_done                ; start_lo >= end_lo, nothing to sync
+
+_do_sync:
+        ; Calculate length: end - start
+        sec
+        lda _sync_end_lo
+        sbc _sync_start_lo
+        sta _dma_sync_len_lo
+        lda _sync_end_hi
+        sbc _sync_start_hi
+        sta _dma_sync_len_hi
+        
+        ; Set up source address in bank 5
+        lda _sync_start_lo
+        sta _dma_sync_src_lo
+        lda _sync_start_hi
+        sta _dma_sync_src_hi
+        
+        ; Set up dest address in LOW_RAM_BUFFER
+        clc
+        lda _sync_start_lo
+        sta _dma_sync_dst_lo
+        lda _sync_start_hi
+        adc #>LOW_RAM_BUFFER
+        sta _dma_sync_dst_hi
+        
+        ; DMA sync: Bank 5 -> LOW_RAM_BUFFER (only the loaded portion)
+        lda #$00
+        sta $D707
+        .byte $80,$00,$81,$00,$00
+        .byte $00                       ; copy
+_dma_sync_len_lo:
+        .byte $00
+_dma_sync_len_hi:
+        .byte $00
+_dma_sync_src_lo:
+        .byte $00
+_dma_sync_src_hi:
+        .byte $00
+        .byte P4_BANK_RAM               ; src bank 5
+_dma_sync_dst_lo:
+        .byte $00
+_dma_sync_dst_hi:
+        .byte $00
+        .byte $00                       ; dest bank 0
+        .byte $00
+        .word $0000
+
+_dma_fl_done:
         rts
 
+_sync_start_lo: .byte 0
+_sync_start_hi: .byte 0
+_sync_end_lo:   .byte 0
+_sync_end_hi:   .byte 0
 
 ; ============================================================
 ; Helper routines (from original)
@@ -1977,6 +2168,15 @@ P4HOOK_UnlockVIC:
         sta $D02F
         lda #$53
         sta $D02F
+        
+        ; Restore border/background colors from TED shadow registers
+        lda ted_regs+$19
+        and #$7F
+        sta $D020
+        lda ted_regs+$15
+        and #$7F
+        sta $D021
+        
         rts
 
 
