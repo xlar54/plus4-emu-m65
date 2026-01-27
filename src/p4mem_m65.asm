@@ -258,14 +258,24 @@ _read_not_low_ram:
         bne _read_not_ff
         lda p4_addr_lo
         cmp #$40
-        bcs _read_ff40_plus             ; $FF40+ -> KERNAL ROM
+        bcs _read_ff40_plus             ; $FF40+ -> check ROM visibility
         
         ; $FF00-$FF3F: ALL are TED registers (with $FF20-$FF3F mirroring $FF00-$FF1F)
         jmp read_ted_register
 
 _read_ff40_plus:
-        ; $FF40-$FFFF: KERNAL ROM
-        jmp read_from_kernal
+        ; $FF40-$FFFF: Check ROM visibility
+        ; If ROM is visible, read from KERNAL ROM
+        ; If ROM is disabled (RAM mode), read from RAM
+        lda p4_rom_visible
+        beq _read_ff40_ram              ; ROM disabled, read from RAM
+        jmp read_from_kernal            ; ROM enabled, read from KERNAL
+
+_read_ff40_ram:
+        ; Read from RAM at $FF40-$FFFF (when ROM is disabled)
+        lda #$FF
+        sta p4_addr_hi                  ; Restore high byte (was clobbered)
+        jmp read_ram_direct
 
 _read_not_ff:
         ; Check for $FD page (ACIA, keyboard)
