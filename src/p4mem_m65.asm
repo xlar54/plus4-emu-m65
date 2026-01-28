@@ -100,6 +100,10 @@ _clear_ted:
         sta ted_regs,x
         dex
         bpl _clear_ted
+
+        ; Initialize $FF16 to proper Plus/4 64KB value
+        lda #$DB
+        sta ted_regs+$16
         
         ; Initialize TED color registers to Plus/4 defaults
         lda #$71                ; Default background (white, lum 7, color 1)
@@ -264,17 +268,18 @@ _read_not_low_ram:
         jmp read_ted_register
 
 _read_ff40_plus:
-        ; $FF40-$FFFF: Check ROM visibility
-        ; If ROM is visible, read from KERNAL ROM
-        ; If ROM is disabled (RAM mode), read from RAM
+        ; $FFFA-$FFFF: Always KERNAL ROM (hardware vectors)
+        lda p4_addr_lo
+        cmp #$FA
+        bcs read_from_kernal            ; $FFFA-$FFFF always ROM
+
+        ; $FF40-$FFF9: Check ROM visibility
         lda p4_rom_visible
         beq _read_ff40_ram              ; ROM disabled, read from RAM
         jmp read_from_kernal            ; ROM enabled, read from KERNAL
 
 _read_ff40_ram:
-        ; Read from RAM at $FF40-$FFFF (when ROM is disabled)
-        lda #$FF
-        sta p4_addr_hi                  ; Restore high byte (was clobbered)
+        ; Read from RAM at $FF40-$FFF9 (when ROM is disabled)
         jmp read_ram_direct
 
 _read_not_ff:
@@ -322,15 +327,28 @@ read_ram_direct:
 ; $FF20-$FF3F mirrors $FF00-$FF1F
 ; ============================================================
 read_ted_register:
+
         lda p4_addr_lo
         and #$1F                        ; Mask to $00-$1F (handle mirroring)
         
+        cmp #$00
+        beq _read_timer1_lo             ; $FF00 = Timer 1 low (running value)
+        cmp #$01
+        beq _read_timer1_hi             ; $FF01 = Timer 1 high (running value)
         cmp #$08
         beq _read_keyboard
+        cmp #$12
+        beq _read_ff12
+        cmp #$13
+        beq _read_ff13
         cmp #$15
         beq _read_ff15
         cmp #$16
         beq _read_ff16              ; RAM size / memory config register
+        cmp #$17
+        beq _read_ff17
+        cmp #$18
+        beq _read_ff18
         cmp #$19
         beq _read_ff19
         cmp #$1C
@@ -342,11 +360,25 @@ read_ted_register:
         lda ted_regs,x
         rts
 
+_read_timer1_lo:
+        lda ted_timer1_lo
+        rts
+
+_read_timer1_hi:
+        lda ted_timer1_hi
+        rts
+_read_ff12:
+        lda ted_regs+$12
+        ora #$C0                ; Set bits 7 and 6
+        rts
+_read_ff13:
+        lda ted_regs+$13
+        ora #$C1
+        rts
 _read_ff15:
         lda ted_regs+$15
         ora #$80
         rts
-
 _read_ff16:
         ; $FF16 is the RAM size / memory configuration register
         ; On Plus/4 (64KB): reading returns $C0 (bits 7,6 set) regardless of what was written
@@ -355,7 +387,15 @@ _read_ff16:
         lda ted_regs+$16
         ora #$C0                        ; Set bits 7 and 6 for 64KB Plus/4
         rts
+_read_ff17:
+        lda ted_regs+$17
+        ora #$80
+        rts
 
+_read_ff18:
+        lda ted_regs+$18
+        ora #$80
+        rts
 _read_ff19:
         lda ted_regs+$19
         ora #$80

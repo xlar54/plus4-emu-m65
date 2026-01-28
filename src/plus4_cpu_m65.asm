@@ -623,11 +623,14 @@ _step_execute:
         jmp (p4_vec_lo)
 
 op_illegal:
-        ;lda #2
-        ;jmp finish_cycles
         lda #$00
         sta $d020
-        jmp op_illegal
+
+        ; monitor
+        ; Force ROM visible for BRK handler
+        lda #1
+        sta p4_rom_visible
+        jmp op_00
 
 ; --- branch_do ---
 branch_do:
