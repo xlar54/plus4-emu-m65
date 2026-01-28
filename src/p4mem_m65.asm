@@ -341,6 +341,8 @@ read_ted_register:
         beq _read_ff12
         cmp #$13
         beq _read_ff13
+        cmp #$14
+        beq _read_ff14
         cmp #$15
         beq _read_ff15
         cmp #$16
@@ -374,6 +376,10 @@ _read_ff12:
 _read_ff13:
         lda ted_regs+$13
         ora #$C1
+        rts
+_read_ff14:
+        lda ted_regs+$14
+        ora #$07                ; Set bits 0-2 (not connected)
         rts
 _read_ff15:
         lda ted_regs+$15
