@@ -20,7 +20,7 @@ p4_vec_lo   = $0c
 p4_vec_hi   = $0d
 p4_tmp      = $0e
 p4_tmp2     = $0f
-p4_cycles   = $10
+
 p4_xtra     = $11
 p4_dec_a    = $12           ; Saved A for decimal mode ADC/SBC
 p4_inst_pc_lo = $1A
@@ -41,47 +41,22 @@ P_N = %10000000
 
 
 p4_kbd_sel:          .byte $FF  ; Keyboard selector written to $FD30
+p4_joy_sel:          .byte $FF  ; Joystick selector written to $FF08
 
 ; TED timing constants (PAL)
 TED_CYCLES_PER_LINE = 57    ; ~57 cycles per scanline
 TED_LINES_PER_FRAME = 312   ; PAL has 312 lines
 
-; --- set_zn_a: set Z and N flags from A ---
-set_zn_a:
-;        pha
-;        lda p4_p
-;        and #(~(P_Z|P_N)) & $ff
-;        sta p4_p
-;        pla
-;        pha
-;        beq _set_zn_z
-;        jmp _set_zn_chk_n
-;_set_zn_z:
-;        lda p4_p
-;        ora #P_Z
-;        sta p4_p
-;_set_zn_chk_n:
-;        pla
-;        bmi _set_zn_n
-;        rts
-;_set_zn_n:
-;        lda p4_p
-;        ora #P_N
- ;       sta p4_p
-;        rts
 
-        pha                     ; preserve A for caller
-        phx                     ; preserve X for caller
-
+set_zna .macro
         tax                     ; X = result byte (original A)
         lda p4_p
         and #(~(P_Z|P_N)) & $ff  ; clear old Z/N
         ora zn_table,x           ; OR in new Z/N
         sta p4_p
+        txa
+.endmacro
 
-        plx
-        pla
-        rts
 
 ; ------------------------------------------------------------
 ; Z/N lookup table: entry = (val==0 ? P_Z : 0) | (val&$80 ? P_N : 0)
@@ -106,20 +81,153 @@ zn_table:
         .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
 
 
-; --- inc_pc ---
-inc_pc:
+; -----------------------------------------------------------------
+; ZP: fast code-fetch cache (host-side)
+; -----------------------------------------------------------------
+p4_code_ptr       = $E0   ; 4 bytes: lo, hi, bank, megabyte
+p4_code_page_hi   = $E4   ; cached p4_pc_hi (guest)
+p4_code_valid     = $E5   ; 0=invalid, !=0 valid
+p4_code_romvis    = $E6   ; cached p4_rom_visible snapshot
+
+; Call this when you want to force cache rebuild (optional helper)
+invalidate_code_cache:
+        lda #$00
+        sta p4_code_valid
+        rts
+
+; -----------------------------------------------------------------
+; fetch8_fast: A = mem[PC], PC++
+; Fast path for:
+;   - $0000-$0FFF via LOW_RAM_BUFFER mirror
+;   - $1000-$7FFF via BANK_RAM
+;   - $8000-$FFFF via BANK_ROM when p4_rom_visible=1, else BANK_RAM
+; Slow fallback for:
+;   - $FDxx and $FFxx (I/O), and anything you want to be conservative about
+; -----------------------------------------------------------------
+fetch8:
+        ; If cache invalid, rebuild
+        lda p4_code_valid
+        beq _f8_rebuild
+
+        ; If page changed, rebuild
+        lda p4_pc_hi
+        cmp p4_code_page_hi
+        bne _f8_rebuild
+
+        ; If we’re in >=$80, ROM visibility affects whether we read ROM or RAM
+        lda p4_pc_hi
+        cmp #$80
+        bcc _f8_do_read
+
+        ; Conservative: never fast-fetch from FD/FF pages (I/O + TED)
+        cmp #$FD
+        beq _f8_slow
+        cmp #$FF
+        beq _f8_slow
+
+        ; ROM visibility changed since cache built?
+        lda p4_rom_visible
+        cmp p4_code_romvis
+        bne _f8_rebuild
+
+_f8_do_read:
+        ldz p4_pc_lo
+        lda [p4_code_ptr],z
         inw p4_pc_lo
         rts
 
-; --- fetch8: A = mem[PC], PC++ ---
-fetch8:
+; -----------------------------
+; Cache rebuild
+; -----------------------------
+_f8_rebuild:
+        lda p4_pc_hi
+        sta p4_code_page_hi
+
+        ; Default: remember current ROM-visible flag
+        lda p4_rom_visible
+        sta p4_code_romvis
+
+        lda p4_pc_hi
+
+        ; $0000-$0FFF => LOW_RAM_BUFFER mirror
+        cmp #$10
+        bcc _f8_build_low
+
+        ; Be conservative: $FDxx / $FFxx => slow path
+        cmp #$FD
+        beq _f8_build_slow
+        cmp #$FF
+        beq _f8_build_slow
+
+        ; $1000-$7FFF => RAM
+        cmp #$80
+        bcc _f8_build_ram
+
+        ; >=$8000 => ROM if visible, else RAM
+        lda p4_rom_visible
+        beq _f8_build_ram
+
+        ; ROM visible => BANK_ROM, same hi byte ($80-$FF maps correctly)
+        lda #$00
+        sta p4_code_ptr+0           ; lo base = 0
+        lda p4_pc_hi
+        sta p4_code_ptr+1           ; hi = page
+        lda #BANK_ROM
+        sta p4_code_ptr+2
+        lda #$00
+        sta p4_code_ptr+3
+        lda #$01
+        sta p4_code_valid
+        jmp _f8_do_read
+
+_f8_build_ram:
+        lda #$00
+        sta p4_code_ptr+0
+        lda p4_pc_hi
+        sta p4_code_ptr+1
+        lda #BANK_RAM
+        sta p4_code_ptr+2
+        lda #$00
+        sta p4_code_ptr+3
+        lda #$01
+        sta p4_code_valid
+        jmp _f8_do_read
+
+_f8_build_low:
+        lda #$00
+        sta p4_code_ptr+0           ; lo base = 0
+        lda p4_pc_hi
+        clc
+        adc #>LOW_RAM_BUFFER        ; map guest page into LOW_RAM_BUFFER page
+        sta p4_code_ptr+1
+        lda #$00
+        sta p4_code_ptr+2           ; bank 0
+        sta p4_code_ptr+3           ; MB 0
+        lda #$01
+        sta p4_code_valid
+        jmp _f8_do_read
+
+_f8_build_slow:
+        lda #$00
+        sta p4_code_valid
+        ; fall through
+
+; -----------------------------
+; Slow path: original behavior
+; -----------------------------
+_f8_slow:
         lda p4_pc_lo
         sta p4_addr_lo
         lda p4_pc_hi
         sta p4_addr_hi
         jsr P4MEM_Read
-        inw p4_pc_lo            ; Inlined inc_pc
+        inw p4_pc_lo
         rts
+
+;===========end new
+
+
+
 
 ; --- fetch16_to_addr ---
 fetch16_to_addr:
@@ -290,58 +398,67 @@ fetch_rel:
         sta p4_tmp
         rts
 
-; --- finish_cycles ---
+; Batched TED Timing
+; ============================================================
+; Quick cycle accumulator - called after every opcode
+; Only does full TED processing when we hit a scanline boundary
+; ============================================================
 finish_cycles:
-        sta p4_cycles
-        lda p4_xtra
-        beq _finish_tick
-        lda p4_cycles
+        ; Add base cycles + extra cycles
         clc
         adc p4_xtra
-        sta p4_cycles
-_finish_tick:
-        lda p4_cycles
-        jsr TED_Tick
+        
+        ; Quick accumulate - no JSR overhead
+        clc
+        adc ted_cycle_accum
+        sta ted_cycle_accum
+        
+        ; Check if we've completed a scanline (57+ cycles)
+        cmp #TED_CYCLES_PER_LINE
+        bcs _finish_do_ted
         rts
 
-; ============================================================
-; TED_Tick - Advance TED timing by A cycles
-; Tracks raster line and triggers IRQ when raster matches compare
-; Also handles Timer 1 countdown
-; ============================================================
-TED_Tick:
-        sta ted_add_cycles
+_finish_do_ted:
+        ; Only now do the expensive TED processing
+
+_ted_line_loop:
+        ; Subtract one scanline
+        lda ted_cycle_accum
+        sec
+        sbc #TED_CYCLES_PER_LINE
+        sta ted_cycle_accum
         
-        ; === Timer 1 countdown ===
-        ; Timer 1 counts down every cycle
+        ; === Timer 1 countdown (per line, not per cycle for speed) ===
+        ; Approximate: subtract 57 from timer each line
         lda ted_timer1_lo
         sec
-        sbc ted_add_cycles
+        sbc #TED_CYCLES_PER_LINE
         sta ted_timer1_lo
         bcs _timer1_no_borrow
+        
         ; Borrow from high byte
         dec ted_timer1_hi
         lda ted_timer1_hi
-        cmp #$FF                ; Did we underflow?
+        cmp #$FF                ; Underflow?
         bne _timer1_no_borrow
         
-        ; Timer 1 underflowed! Reload and trigger IRQ
-        lda ted_regs+$00        ; Reload low
+        ; Timer 1 underflowed - reload and check IRQ
+        lda ted_regs+$00
         sta ted_timer1_lo
-        lda ted_regs+$01        ; Reload high
+        lda ted_regs+$01
         sta ted_timer1_hi
         
-        ; Set Timer 1 IRQ flag (bit 3 in $FF09)
+        ; Set Timer 1 IRQ flag (bit 3)
         lda ted_regs+$09
         ora #$08
         sta ted_regs+$09
         
-        ; Check if Timer 1 IRQ is enabled (bit 3 in $FF0A)
+        ; Check if Timer 1 IRQ enabled
         lda ted_regs+$0A
         and #$08
         beq _timer1_no_borrow
         
-        ; Set IRQ occurred flag and signal CPU
+        ; Trigger IRQ
         lda ted_regs+$09
         ora #$80
         sta ted_regs+$09
@@ -349,24 +466,6 @@ TED_Tick:
         sta p4_irq_pending
 
 _timer1_no_borrow:
-        
-        ; Accumulate cycles for raster
-        lda ted_cycle_accum
-        clc
-        adc ted_add_cycles
-        sta ted_cycle_accum
-        
-_ted_line_loop:
-        ; Check if we've completed a scanline
-        lda ted_cycle_accum
-        cmp #TED_CYCLES_PER_LINE
-        bcc _ted_done
-        
-        ; Subtract one line's worth of cycles
-        sec
-        sbc #TED_CYCLES_PER_LINE
-        sta ted_cycle_accum
-        
         ; Advance raster line
         inc ted_raster_lo
         bne _ted_check_wrap
@@ -376,83 +475,83 @@ _ted_check_wrap:
         ; Wrap at 312 lines (PAL)
         lda ted_raster_hi
         cmp #$01
-        bcc _ted_check_irq      ; < 256, no wrap yet
+        bcc _ted_check_raster_irq
         lda ted_raster_lo
         cmp #$38                ; 312 = $138
-        bcc _ted_check_irq
-        ; Wrap to line 0
+        bcc _ted_check_raster_irq
+        
+        ; Frame complete - wrap to line 0
         lda #0
         sta ted_raster_lo
         sta ted_raster_hi
+        
+        ; Per-frame tasks
+        jsr TED_FrameTasks
 
-        ; Present video once per frame (bitmap mode uses this)
+_ted_check_raster_irq:
+        ; Quick raster compare
+        lda ted_regs+$0B
+        cmp ted_raster_lo
+        bne _ted_next_line
+        lda ted_regs+$0A
+        and #$01
+        cmp ted_raster_hi
+        bne _ted_next_line
+        
+        ; Raster match - check if already triggered
+        lda ted_regs+$09
+        and #$02
+        bne _ted_next_line
+        
+        ; Set raster flag
+        lda ted_regs+$09
+        ora #$02
+        sta ted_regs+$09
+        
+        ; Check if raster IRQ enabled
+        lda ted_regs+$0A
+        and #$02
+        beq _ted_next_line
+        
+        ; Trigger IRQ
+        lda ted_regs+$09
+        ora #$80
+        sta ted_regs+$09
+        lda #1
+        sta p4_irq_pending
+
+_ted_next_line:
+        ; More lines to process?
+        lda ted_cycle_accum
+        cmp #TED_CYCLES_PER_LINE
+        bcs _ted_line_loop
+        rts
+
+
+; ============================================================
+; TED_FrameTasks - Called once per frame (at line 0)
+; ============================================================
+TED_FrameTasks:
+        ; Video frame update
         jsr P4VID_Frame
-
-        ; Check MEGA65 cursor keys and inject into Plus/4 buffer (once per frame)
-        ;jsr P4_CheckCursorKeys
-
-        ; Cursor blink only makes sense in text mode
+        
+        ; Cursor blink (text mode only)
         lda p4_video_mode
-        bne _no_cur_toggle
-
+        bne _frame_done
+        
         inc p4_cur_div
         lda p4_cur_div
-        cmp #8 ; cursor blink rate
-        bcc _no_cur_toggle
+        cmp #8
+        bcc _frame_done
+        
         lda #0
         sta p4_cur_div
         lda p4_cur_phase
         eor #1
         sta p4_cur_phase
         jsr P4VID_UpdateCursor
-_no_cur_toggle:
-        
-_ted_check_irq:
-        ; Check if raster matches compare register for IRQ
-        jsr TED_CheckRasterIRQ
-        jmp _ted_line_loop
-        
-_ted_done:
-        rts
 
-; ============================================================
-; TED_CheckRasterIRQ - Check if raster IRQ should fire
-; Compares current raster to $FF0A(bit0)/$FF0B compare value
-; Sets p4_irq_pending if match and IRQ enabled
-; ============================================================
-TED_CheckRasterIRQ:
-        ; Build compare value: high bit from $FF0A bit 0, low byte from $FF0B
-        lda ted_regs+$0B        ; Compare low byte
-        cmp ted_raster_lo
-        bne _raster_no_match
-        lda ted_regs+$0A        ; Compare high bit
-        and #$01
-        cmp ted_raster_hi
-        bne _raster_no_match
-
-        ; Raster matches! Check if flag already set (already triggered this line)
-        lda ted_regs+$09
-        and #$02
-        bne _raster_no_match    ; Already flagged, don't re-trigger
-        
-        ; Set raster flag (bit 1) in $FF09
-        lda ted_regs+$09
-        ora #$02                ; Set raster IRQ flag
-        sta ted_regs+$09
-        
-        ; Check if raster IRQ is enabled (bit 1 in $FF0A)
-        lda ted_regs+$0A
-        and #$02
-        beq _raster_no_match    ; IRQ not enabled
-        
-        ; Set IRQ occurred flag (bit 7) and signal CPU
-        lda ted_regs+$09
-        ora #$80
-        sta ted_regs+$09
-        lda #1
-        sta p4_irq_pending
-        
-_raster_no_match:
+_frame_done:
         rts
 
 ; TED state variables
@@ -461,7 +560,6 @@ ted_regs:
 ted_cycle_accum:  .byte 0
 ted_timer1_lo:    .byte $FF     ; Timer 1 current value (starts at $FFFF)
 ted_timer1_hi:    .byte $FF
-ted_add_cycles:   .byte 0
 ted_raster_lo:    .byte 0
 ted_raster_hi:    .byte 0
 
@@ -749,7 +847,8 @@ _adc_dec_noc:
         sta p4_p
 _adc_dec_nov:
         lda p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         rts
 
 _do_adc_bin:
@@ -781,7 +880,8 @@ _adc_noc2:
         sta p4_p
 _adc_nov2:
         lda p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         rts
 
 
@@ -867,7 +967,8 @@ _sbc_dec_noc:
         sta p4_p
 _sbc_dec_nov:
         lda p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         rts
 
 _do_sbc_bin:
@@ -899,7 +1000,8 @@ _sbc_noc2:
         sta p4_p
 _sbc_nov2:
         lda p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         rts
 
 ; --- do_cmp ---
@@ -1036,7 +1138,8 @@ op_01:
         jsr P4MEM_Read
         ora p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -1046,7 +1149,8 @@ op_05:
         jsr P4MEM_Read
         ora p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #3
         jmp finish_cycles
 
@@ -1068,7 +1172,8 @@ op_06:
         sta p4_p
 _op06_nc:
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -1086,7 +1191,8 @@ op_09:
         jsr fetch8
         ora p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -1106,7 +1212,8 @@ op_0a:
         sta p4_p
 _op0a_nc:
         lda p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -1116,7 +1223,8 @@ op_0d:
         jsr P4MEM_Read
         ora p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1138,7 +1246,8 @@ op_0e:
         sta p4_p
 _op0e_nc:
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -1168,7 +1277,8 @@ op_11:
         jsr P4MEM_Read
         ora p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -1178,7 +1288,8 @@ op_15:
         jsr P4MEM_Read
         ora p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1200,7 +1311,8 @@ op_16:
         sta p4_p
 _op16_nc:
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -1218,7 +1330,8 @@ op_19:
         jsr P4MEM_Read
         ora p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1228,7 +1341,8 @@ op_1d:
         jsr P4MEM_Read
         ora p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1250,7 +1364,8 @@ op_1e:
         sta p4_p
 _op1e_nc:
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #7
         jmp finish_cycles
 
@@ -1285,7 +1400,8 @@ op_21:
         jsr P4MEM_Read
         and p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -1321,7 +1437,8 @@ op_25:
         jsr P4MEM_Read
         and p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #3
         jmp finish_cycles
 
@@ -1349,7 +1466,8 @@ op_26:
 _op26_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -1367,7 +1485,8 @@ op_29:
         jsr fetch8
         and p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -1392,7 +1511,8 @@ op_2a:
         sta p4_p
 _op2a_nc:
         lda p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -1428,7 +1548,8 @@ op_2d:
         jsr P4MEM_Read
         and p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1456,7 +1577,8 @@ op_2e:
 _op2e_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -1486,7 +1608,8 @@ op_31:
         jsr P4MEM_Read
         and p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -1496,7 +1619,8 @@ op_35:
         jsr P4MEM_Read
         and p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1524,7 +1648,8 @@ op_36:
 _op36_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -1542,7 +1667,8 @@ op_39:
         jsr P4MEM_Read
         and p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1552,7 +1678,8 @@ op_3d:
         jsr P4MEM_Read
         and p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1580,7 +1707,8 @@ op_3e:
 _op3e_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #7
         jmp finish_cycles
 
@@ -1603,7 +1731,8 @@ op_41:
         jsr P4MEM_Read
         eor p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -1613,7 +1742,8 @@ op_45:
         jsr P4MEM_Read
         eor p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #3
         jmp finish_cycles
 
@@ -1636,7 +1766,8 @@ op_46:
 _op46_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -1653,7 +1784,8 @@ op_49:
         jsr fetch8
         eor p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -1674,7 +1806,8 @@ op_4a:
         sta p4_p
 _op4a_nc:
         lda p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -1694,7 +1827,8 @@ op_4d:
         jsr P4MEM_Read
         eor p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1717,7 +1851,8 @@ op_4e:
 _op4e_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -1747,7 +1882,8 @@ op_51:
         jsr P4MEM_Read
         eor p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -1757,7 +1893,8 @@ op_55:
         jsr P4MEM_Read
         eor p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1780,7 +1917,8 @@ op_56:
 _op56_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -1798,7 +1936,8 @@ op_59:
         jsr P4MEM_Read
         eor p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1808,7 +1947,8 @@ op_5d:
         jsr P4MEM_Read
         eor p4_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1831,7 +1971,8 @@ op_5e:
 _op5e_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #7
         jmp finish_cycles
 
@@ -1895,7 +2036,8 @@ _op66_do:
 _op66_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -1903,7 +2045,8 @@ _op66_nc:
 op_68:
         jsr pull_to_a
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -1942,7 +2085,8 @@ _op6a_do:
         sta p4_p
 _op6a_nc:
         lda p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -1996,7 +2140,8 @@ _op6e_do:
 _op6e_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -2067,7 +2212,8 @@ _op76_do:
 _op76_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -2126,7 +2272,8 @@ _op7e_do:
 _op7e_nc:
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #7
         jmp finish_cycles
 
@@ -2172,7 +2319,8 @@ op_86:
 op_88:
         dec p4_y
         lda p4_y
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2180,7 +2328,8 @@ op_88:
 op_8a:
         lda p4_x
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2215,7 +2364,7 @@ _op8d_check_ff:
         ldx $09                 ; p4_addr_lo
         cpx #$08
         bne _op8d_not_kbd_cli
-        sta p4_kbd_sel          ; Save keyboard selector (FF08 write)
+        sta p4_joy_sel          ; Save joystick selector (FF08 write)
 _op8d_not_kbd_cli:
         cli
 _op8d_not_fd30:
@@ -2295,7 +2444,8 @@ op_96:
 op_98:
         lda p4_y
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2328,7 +2478,8 @@ op_9d:
 op_a0:
         jsr fetch8
         sta p4_y
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2337,7 +2488,8 @@ op_a1:
         jsr addr_indx
         jsr P4MEM_Read
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -2345,7 +2497,8 @@ op_a1:
 op_a2:
         jsr fetch8
         sta p4_x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2356,7 +2509,8 @@ op_a4:
         tax
         lda LOW_RAM_BUFFER,x
         sta p4_y
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #3
         jmp finish_cycles
 
@@ -2367,7 +2521,8 @@ op_a5:
         tax
         lda LOW_RAM_BUFFER,x             ; Direct read from LOW_RAM_BUFFER
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #3
         jmp finish_cycles
 
@@ -2378,7 +2533,8 @@ op_a6:
         tax
         lda LOW_RAM_BUFFER,x
         sta p4_x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #3
         jmp finish_cycles
 
@@ -2386,7 +2542,8 @@ op_a6:
 op_a8:
         lda p4_a
         sta p4_y
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2394,7 +2551,8 @@ op_a8:
 op_a9:
         jsr fetch8
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2402,7 +2560,8 @@ op_a9:
 op_aa:
         lda p4_a
         sta p4_x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2411,7 +2570,8 @@ op_ac:
         jsr addr_abs
         jsr P4MEM_Read
         sta p4_y
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2420,7 +2580,8 @@ op_ad:
         jsr addr_abs
         jsr P4MEM_Read
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2429,7 +2590,8 @@ op_ae:
         jsr addr_abs
         jsr P4MEM_Read
         sta p4_x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2458,7 +2620,8 @@ op_b1:
         jsr addr_indy
         jsr P4MEM_Read
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -2467,7 +2630,8 @@ op_b4:
         jsr addr_zpx
         jsr P4MEM_Read
         sta p4_y
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2476,7 +2640,8 @@ op_b5:
         jsr addr_zpx
         jsr P4MEM_Read
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2485,7 +2650,8 @@ op_b6:
         jsr addr_zpy
         jsr P4MEM_Read
         sta p4_x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2502,7 +2668,8 @@ op_b9:
         jsr addr_absy
         jsr P4MEM_Read
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2510,7 +2677,8 @@ op_b9:
 op_ba:
         lda p4_sp
         sta p4_x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2519,7 +2687,8 @@ op_bc:
         jsr addr_absx
         jsr P4MEM_Read
         sta p4_y
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2528,7 +2697,8 @@ op_bd:
         jsr addr_absx
         jsr P4MEM_Read
         sta p4_a
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2537,7 +2707,8 @@ op_be:
         jsr addr_absy
         jsr P4MEM_Read
         sta p4_x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #4
         jmp finish_cycles
 
@@ -2579,7 +2750,8 @@ op_c6:
         tax
         dec LOW_RAM_BUFFER,x
         lda LOW_RAM_BUFFER,x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -2587,7 +2759,8 @@ op_c6:
 op_c8:
         inc p4_y
         lda p4_y
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2602,7 +2775,8 @@ op_c9:
 op_ca:
         dec p4_x
         lda p4_x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2631,7 +2805,8 @@ op_ce:
         sta p4_data
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -2680,7 +2855,8 @@ op_d6:
         sta p4_data
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -2717,7 +2893,8 @@ op_de:
         sta p4_data
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #7
         jmp finish_cycles
 
@@ -2759,7 +2936,8 @@ op_e6:
         tax
         inc LOW_RAM_BUFFER,x
         lda LOW_RAM_BUFFER,x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #5
         jmp finish_cycles
 
@@ -2767,7 +2945,8 @@ op_e6:
 op_e8:
         inc p4_x
         lda p4_x
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #2
         jmp finish_cycles
 
@@ -2808,7 +2987,8 @@ op_ee:
         sta p4_data
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -2857,7 +3037,8 @@ op_f6:
         sta p4_data
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #6
         jmp finish_cycles
 
@@ -2894,7 +3075,8 @@ op_fe:
         sta p4_data
         jsr P4MEM_Write
         lda p4_data
-        jsr set_zn_a
+        ;jsr set_zn_a
+        #set_zna
         lda #7
         jmp finish_cycles
 

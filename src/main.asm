@@ -60,8 +60,7 @@ _banner:
         bne _banner
 _banner_done:
 
-        ; clear bank 4
-        ; use DMA to clear bank 5
+        ; use DMA to clear bank 4
         lda #$00
         sta $D707
         .byte $80                       ; enhanced dma - src bits 20-27
@@ -74,7 +73,7 @@ _banner_done:
         .word $0000                     ; fill with $00 (second byte)
         .byte $00                       ; unusued with fill
         .word $0000                     ; destination start
-        .byte $04                       ; dest bank 5
+        .byte $04                       ; dest bank 4
         .byte $00                       ; command high byte
         .word $0000                     ; modulo (ignored)
 
@@ -86,6 +85,10 @@ _banner_done:
         ldx #$08
         ldy #$00
         jsr setlfs
+
+        ;=============================================================================
+        ; Load KERNAL ROM
+        ;==============================================================================
 
         ; ----------------------------------------------------
         ; 1) Load KERNAL ROM to staging area of $8000 bank 0
@@ -117,8 +120,9 @@ _k_msg: lda kernal_ok_msg,x
         bne _k_msg
 _k_done:
 
-        ; use DMA to copy the bytes
-        ; 8000 -> C000 (kernel) in bank 4
+        ; ----------------------------------------------------
+        ; DMA copy $08000 (staging) to $4C000 (+4 BASIC ROM)
+        ; ----------------------------------------------------
         lda #$00
         sta $D707
         .byte $80                       ; enhanced dma - src bits 20-27
@@ -133,20 +137,12 @@ _k_done:
         .byte $00                       ; command high byte
         .word $0000                     ; modulo (ignored)
 
-        
-        ; DMA copy 2 bytes from bank 4 $C000 to $4000 bank 0
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00   ; options
-        .byte $00                       ; copy
-        .word $0002                     ; count = 2
-        .byte $00, $C0, $04             ; src: $C000, bank 4
-        .byte $00, $A0, $00             ; dst: $4000, bank 0
-        .byte $00
-        .word $0000
+        ;=============================================================================
+        ; Load BASIC ROM
+        ;==============================================================================
 
         ; ----------------------------------------------------
-        ; 2) Load BASIC ROM to $8000
+        ; 1) Load BASIC ROM to staging area of $8000 bank 0
         ; ----------------------------------------------------
         ldx #<basic_name
         ldy #>basic_name
@@ -175,8 +171,9 @@ _b_msg: lda basic_ok_msg,x
         bne _b_msg
 _b_done:
 
-        ; use DMA to copy the bytes
-        ; 8000 -> 48000 (basic ROM)
+        ; ----------------------------------------------------
+        ; DMA copy $08000 (staging) to $48000 (+4 KERNAL ROM)
+        ; ----------------------------------------------------
         lda #$00
         sta $D707
         .byte $80                       ; enhanced dma - src bits 20-27
@@ -191,21 +188,6 @@ _b_done:
         .byte $00                       ; command high byte
         .word $0000                     ; modulo (ignored)
 
-        
-        ; DMA copy 256 bytes from bank 4 $FF00 to bank 0 $4000
-        lda #$00
-        sta $D707
-        .byte $80                ; enhanced dma - src MB
-        .byte $00                ; src MB = 0
-        .byte $81                ; enhanced dma - dest MB
-        .byte $00                ; dest MB = 0
-        .byte $00                ; end of options
-        .byte $00                ; command = copy
-        .word $0100              ; count = 256
-        .byte $00, $FF, $04      ; src: $FF00, bank 4
-        .byte $00, $A0, $00      ; dst: $4000, bank 0
-        .byte $00                ; cmd hi
-        .word $0000              ; modulo
 
         ; ----------------------------------------------------
         ; 3) Initialize memory system (clears Plus/4 RAM in bank 5)
