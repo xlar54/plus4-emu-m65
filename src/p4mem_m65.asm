@@ -150,6 +150,11 @@ P4MEM_InitVideo:
         ; Initialize the TED 128-color palette for border/background
         jsr P4VID_InitPalette
         
+        ; CRITICAL: Disable VIC-IV hot register propagation BEFORE setting pointers
+        ; Otherwise $D018 writes will override our SCRNPTR/CHARPTR settings
+        lda #$80
+        trb $D05D               ; Clear bit 7 (HOTREG)
+        
         ; ============================================================
         ; Point VIC-IV screen at LOW_RAM_BUFFER + $0C00
         ; Plus/4 low RAM ($0000-$0FFF) is mirrored to LOW_RAM_BUFFER ($A000)
@@ -193,10 +198,6 @@ P4MEM_InitVideo:
         lda $D016
         and #$EF                ; Clear MCM bit
         sta $D016
-        
-        ; Disable VIC-IV hot register propagation (use VIC-IV pointers only)
-        lda #$80
-        trb $D05D               ; Clear bit 7 (HOTREG)
 
         rts
 
