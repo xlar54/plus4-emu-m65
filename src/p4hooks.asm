@@ -11,6 +11,10 @@
 
         .cpu "45gs02"
 
+; p4_hook_pc_changed is defined in plus4_cpu_m65.asm at ZP $E7
+; Hooks set this flag when they modify PC, so the threaded
+; interpreter knows to invalidate the code cache.
+
 ; ------------------------------------------------------------
 ; Hooked guest PC locations
 ; ------------------------------------------------------------
@@ -153,6 +157,21 @@ seq_filename:     .fill 17, 0           ; Filename buffer for sequential files
 seq_filename_len: .byte 0
 
 ; ------------------------------------------------------------
+; P4HOOK_Reset - Reset all hook state variables
+; Called during emulator reset
+; ------------------------------------------------------------
+P4HOOK_Reset:
+        lda #0
+        sta p4_setnam_valid
+        sta p4_setnam_len
+        sta p4_setlfs_sa
+        sta p4_monitor_load
+        sta p4_fl_len
+        lda #8
+        sta p4_setlfs_dev       ; Default device 8
+        rts
+
+; ------------------------------------------------------------
 ; P4HOOK_CheckAndRun
 ;   Called once per emulated instruction, right before opcode fetch.
 ; ------------------------------------------------------------
@@ -168,6 +187,7 @@ P4HOOK_CheckAndRun:
         ; ----- Check for $FFxx addresses (KERNAL calls) -----
         cmp #$FF
         bne _not_ff
+        
         lda p4_pc_lo
         cmp #$BD                        ; SETNAM = $FFBD
         beq _do_setnam
@@ -574,6 +594,8 @@ _lfe_basic:
         sta p4_pc_lo
         lda #>P4HOOK_ROM_AFTER_KERNAL_CALL
         sta p4_pc_hi
+        lda #1
+        sta p4_hook_pc_changed    ; Signal to threaded interpreter
         rts
 
 ; ============================================================
@@ -750,8 +772,30 @@ _dhl_header_chkin_error:
 _dhl_do_load_after_header:
 _dhl_do_load:
         ; --------------------------------------------------------
-        ; Use LOAD to read file data into staging buffer
+        ; Load file directly to guest RAM (bank 5)
+        ; Skip the staging buffer to handle large files
         ; --------------------------------------------------------
+        
+        ; First we need to know the destination address
+        ; SA=0: use TXTTAB, SA!=0: use file header
+        lda p4_setlfs_sa
+        bne _dhl_use_header_addr
+        
+        ; SA=0: destination = TXTTAB
+        lda LOW_RAM_BUFFER + ZP_TXTTAB_LO
+        sta p4_dir_dest_lo
+        lda LOW_RAM_BUFFER + ZP_TXTTAB_HI
+        sta p4_dir_dest_hi
+        jmp _dhl_setup_load
+        
+_dhl_use_header_addr:
+        ; SA!=0: use the header address we captured earlier
+        lda p4_prg_header_lo
+        sta p4_dir_dest_lo
+        lda p4_prg_header_hi
+        sta p4_dir_dest_hi
+        
+_dhl_setup_load:
         ; Set filename
         ldx #<p4_fl_buf
         ldy #>p4_fl_buf
@@ -766,17 +810,35 @@ _dhl_do_load:
 +       ldy #$00                        ; SA=0: use X/Y address, not file header
         jsr SETLFS
         
-        ; Load to staging buffer
+        ; Set destination bank to 5 (guest RAM)
+        lda #P4_BANK_RAM                ; Bank 5 for LOAD destination
+        ldx #$00                        ; Bank 0 for filename
+        jsr SETBNK
+        
+        ; Load directly to guest RAM in bank 5
         lda #$00                        ; 0 = LOAD (not verify)
-        ldx #<P4_DIR_BUF
-        ldy #>P4_DIR_BUF
+        ldx p4_dir_dest_lo
+        ldy p4_dir_dest_hi
         jsr LOAD
-        ; Save end address from LOAD (in X/Y) BEFORE calling UnlockVIC
+        
+        ; Save end address from LOAD (in X/Y)
         stx p4_fl_end_lo
         sty p4_fl_end_hi
-        php                             ; Save carry (error flag)
+        php                             ; Save carry flag (error status from LOAD)
+        
+        ; Close the logical file to clean up KERNAL state
+        lda #$01                        ; LFN we used
+        jsr CLOSE
+        jsr CLRCHN                      ; Clear channels
+        
+        ; Reset SETBNK back to bank 0 for subsequent operations
+        lda #$00                        ; Bank 0 for both
+        ldx #$00
+        jsr SETBNK
+        
         jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
-        plp                             ; Restore carry
+        
+        plp                             ; Restore carry flag from LOAD
         bcc _dhl_load_ok
         
         ; Load failed
@@ -789,15 +851,13 @@ _dhl_load_ok:
         jsr P4Host_PrintString
         
         ; Calculate loaded length
-        ; The KERNAL LOAD with SA=0 loads to our X/Y address
-        ; and returns end address in X/Y
-        ; Length = end - start (no header in buffer)
+        ; We loaded directly to destination, so length = end - dest
         lda p4_fl_end_lo
         sec
-        sbc #<P4_DIR_BUF
+        sbc p4_dir_dest_lo
         sta p4_dir_len_lo
         lda p4_fl_end_hi
-        sbc #>P4_DIR_BUF
+        sbc p4_dir_dest_hi
         sta p4_dir_len_hi
         
         ; Need at least 1 byte of data
@@ -807,29 +867,9 @@ _dhl_load_ok:
         beq _dhl_error_set
 
 _dhl_has_data:
-        ; Determine destination address
-        ; SA=0: use TXTTAB, SA!=0: use file header address we captured
-        lda p4_setlfs_sa
-        bne _dhl_use_file_addr
-        
-        ; SA=0: destination = TXTTAB
-        lda LOW_RAM_BUFFER + ZP_TXTTAB_LO
-        sta p4_dir_dest_lo
-        lda LOW_RAM_BUFFER + ZP_TXTTAB_HI
-        sta p4_dir_dest_hi
-        jmp _dhl_do_copy
-
-_dhl_use_file_addr:
-        ; Use address from PRG header we captured earlier
-        lda p4_prg_header_lo
-        sta p4_dir_dest_lo
-        lda p4_prg_header_hi
-        sta p4_dir_dest_hi
-
-_dhl_do_copy:
-        ; DMA copy to guest memory
-        ; Buffer contains only data (no header)
-        jsr P4HOOK_DMACopyFileToGuest
+        ; We loaded directly to bank 5, so we need to sync LOW_RAM_BUFFER
+        ; for addresses $0000-$0FFF if the load touched that area
+        jsr P4HOOK_SyncLowRAMFromBank5
         
         ; Clear KERNAL status
         lda #$00
@@ -851,6 +891,15 @@ _dhl_do_copy:
         jmp _dhl_set_pc
 
 _dhl_error_set:
+        ; Clean up KERNAL state before error handling
+        lda #$01                        ; LFN we may have used
+        jsr CLOSE
+        jsr CLRCHN
+        lda #$00
+        ldx #$00
+        jsr SETBNK                      ; Reset to bank 0
+        jsr P4HOOK_UnlockVIC
+        
         ; Print appropriate error message based on caller
         lda p4_monitor_load
         bne _dhl_error_monitor
@@ -897,6 +946,9 @@ _dhl_basic_return:
         sta p4_pc_lo
         lda #>P4HOOK_ROM_AFTER_KERNAL_CALL
         sta p4_pc_hi
+        
+        lda #1
+        sta p4_hook_pc_changed    ; Signal to threaded interpreter
         rts
 
 P4Host_Msg_Monitor_FileNotFound:
@@ -1323,6 +1375,8 @@ _ld_bypass:
         sta p4_pc_lo
         lda #>P4HOOK_ROM_AFTER_KERNAL_CALL
         sta p4_pc_hi
+        lda #1
+        sta p4_hook_pc_changed    ; Signal to threaded interpreter
         rts
 
 _ld_end_lo: .byte 0
@@ -1415,27 +1469,9 @@ _dma_fl_dst_hi:
         sta _sync_end_hi
 
 _sync_calc_range:
-        ; Calculate start of sync: max(dest, $0200) to skip ZP/stack
-        lda p4_dir_dest_hi
-        bne _sync_start_is_dest         ; dest >= $0100, check further
-        ; dest_hi == 0, so dest < $0100, use $0200 as start
-        lda #$00
-        sta _sync_start_lo
-        lda #$02
-        sta _sync_start_hi
-        jmp _sync_check_range
-        
-_sync_start_is_dest:
-        cmp #$02
-        bcs _sync_use_dest              ; dest >= $0200, use dest as start
-        ; dest is $01xx (in stack area), use $0200
-        lda #$00
-        sta _sync_start_lo
-        lda #$02
-        sta _sync_start_hi
-        jmp _sync_check_range
-        
-_sync_use_dest:
+        ; Calculate start of sync: use actual dest address
+        ; We MUST sync stack page ($0100-$01FF) because depackers run from there!
+        ; The original code skipped $0000-$01FF but this breaks depackers
         lda p4_dir_dest_lo
         sta _sync_start_lo
         lda p4_dir_dest_hi
@@ -2126,6 +2162,8 @@ P4HOOK_RTS_Guest:
         lda tmp_hi
         adc #$00
         sta p4_pc_hi
+        lda #1
+        sta p4_hook_pc_changed    ; Signal to threaded interpreter
         rts
 
 
@@ -2904,3 +2942,110 @@ P4HOOK_PostFileOpVideoFix:
 
 _pfov_done:
         rts
+
+; ============================================================
+; P4HOOK_SyncLowRAMFromBank5 - Sync LOW_RAM_BUFFER from bank 5
+; Called after loading directly to bank 5 to update the cached
+; copy of $0000-$0FFF in LOW_RAM_BUFFER
+; ============================================================
+P4HOOK_SyncLowRAMFromBank5:
+        ; Check if load touched low RAM area ($0000-$0FFF)
+        ; If dest >= $1000, no need to sync
+        lda p4_dir_dest_hi
+        cmp #$10
+        bcs _sync_b5_done               ; dest >= $1000, nothing to sync
+        
+        ; Calculate the range to sync
+        ; Start = dest address (clamped to $0000)
+        lda p4_dir_dest_lo
+        sta _sync_b5_start_lo
+        lda p4_dir_dest_hi
+        sta _sync_b5_start_hi
+        
+        ; End = min(dest + len, $1000)
+        clc
+        lda p4_dir_dest_lo
+        adc p4_dir_len_lo
+        sta _sync_b5_end_lo
+        lda p4_dir_dest_hi
+        adc p4_dir_len_hi
+        sta _sync_b5_end_hi
+        
+        ; Clamp end to $1000
+        lda _sync_b5_end_hi
+        cmp #$10
+        bcc _sync_b5_calc_len
+        lda #$00
+        sta _sync_b5_end_lo
+        lda #$10
+        sta _sync_b5_end_hi
+        
+_sync_b5_calc_len:
+        ; Calculate length = end - start
+        lda _sync_b5_end_lo
+        sec
+        sbc _sync_b5_start_lo
+        sta _sync_b5_len_lo
+        lda _sync_b5_end_hi
+        sbc _sync_b5_start_hi
+        sta _sync_b5_len_hi
+        
+        ; If length <= 0, nothing to sync
+        ora _sync_b5_len_lo
+        beq _sync_b5_done
+        
+        ; Fill in DMA list
+        ; Count
+        lda _sync_b5_len_lo
+        sta _sync_b5_dma_count
+        lda _sync_b5_len_hi
+        sta _sync_b5_dma_count+1
+        
+        ; Source address (bank 5)
+        lda _sync_b5_start_lo
+        sta _sync_b5_dma_src
+        lda _sync_b5_start_hi
+        sta _sync_b5_dma_src+1
+        
+        ; Dest address (LOW_RAM_BUFFER + start offset)
+        clc
+        lda _sync_b5_start_lo
+        adc #<LOW_RAM_BUFFER
+        sta _sync_b5_dma_dst
+        lda _sync_b5_start_hi
+        adc #>LOW_RAM_BUFFER
+        sta _sync_b5_dma_dst+1
+        
+        ; DMA copy from bank 5 to LOW_RAM_BUFFER
+        lda #$00
+        sta $D702                       ; DMA list bank
+        sta $D704                       ; DMA list address bits 23-16
+        
+        lda #<_sync_b5_dma_list
+        sta $D705
+        lda #>_sync_b5_dma_list
+        sta $D700                       ; Trigger DMA with high byte
+        
+_sync_b5_done:
+        rts
+
+_sync_b5_start_lo: .byte 0
+_sync_b5_start_hi: .byte 0
+_sync_b5_end_lo:   .byte 0
+_sync_b5_end_hi:   .byte 0
+_sync_b5_len_lo:   .byte 0
+_sync_b5_len_hi:   .byte 0
+
+_sync_b5_dma_list:
+        .byte $0A                       ; Request format (F018A with options)
+        .byte $00                       ; End of options
+        .byte $00                       ; Command: COPY
+_sync_b5_dma_count:
+        .word $0000                     ; Count (filled in)
+_sync_b5_dma_src:
+        .word $0000                     ; Source address (filled in)
+        .byte P4_BANK_RAM               ; Source bank 5
+_sync_b5_dma_dst:
+        .word $0000                     ; Dest address (filled in = LOW_RAM_BUFFER + offset)
+        .byte $00                       ; Dest bank 0
+        .word $0000                     ; Modulo (unused)

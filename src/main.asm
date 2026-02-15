@@ -240,7 +240,7 @@ main_loop:
         jsr P4Host_StartPrint
 
 _no_print_start:
-        jsr P4CPU_Step
+        jsr P4CPU_StepMultiple  ; Execute batch of instructions
 
         ; --- If printing, check if done ---
         lda p4h_print_active
@@ -433,4 +433,4 @@ fail_msg:
         .include "p4mem_m65.asm"
         .include "plus4_sound_m65.asm"
         .include "p4host.asm"
-        
+        .include "p4monitor.asm"

@@ -597,6 +597,15 @@ P4MEM_Write:
         cmp #$10
         bcs _write_not_low_ram
         
+        ; Invalidate code cache if writing to current code page
+        ; This is critical for self-modifying code (depackers run from $0100)
+        cmp p4_code_page_hi
+        bne _write_low_no_inv
+        lda #0
+        sta p4_code_valid
+        lda p4_addr_hi              ; Reload A for the write below
+_write_low_no_inv:
+        
         ; Write to LOW_RAM_BUFFER (used for screen/color mirroring in text mode)
         pha                             ; Save page for mirror checks
         clc
@@ -758,7 +767,9 @@ _ted_check_video:
         cpx #$07
         beq _ted_vidchg
         cpx #$14
-        bne _ted_check_other
+        beq _ted_vidchg         ; Just call GfxConfigChanged, don't update screen pointer yet
+        bra _ted_check_other
+        
 _ted_vidchg:
         jsr P4VID_GfxConfigChanged
 
@@ -848,6 +859,14 @@ _write_chk_fdd0:
         rts
 
 p4mem_write_to_ram:
+        ; Check if writing to current code page - invalidate cache if so
+        lda p4_addr_hi
+        cmp p4_code_page_hi
+        bne _wtram_no_inv
+        lda #0
+        sta p4_code_valid
+_wtram_no_inv:
+
         ; Direct 32-bit write to RAM (bank 5)
         lda p4_addr_lo
         sta P4_MEM_PTR
@@ -978,6 +997,76 @@ _gfx_to_text:
 _gfx_already_text:
 _gfx_skip:
         rts
+
+; ============================================================
+; P4VID_ScreenAddrChanged - Called when $FF14 is written
+; Updates VIC-IV SCRNPTR to match Plus/4 screen address
+; ============================================================
+P4VID_ScreenAddrChanged:
+        ; Don't change screen pointer during file operations or bitmap mode
+        lda p4_file_op_active
+        bne _scr_addr_done
+        lda p4_video_mode
+        bne _scr_addr_done      ; In bitmap mode, screen is handled differently
+        
+        ; Calculate Plus/4 screen address from $FF14
+        ; Screen address = (bits 3-7 of $FF14) * $400
+        ; Which is: ($FF14 & $F8) << 6, giving screen address bits 8-15
+        ; Or equivalently: ($FF14 >> 2) & $3C gives the high byte of screen address
+        lda ted_regs+$14
+        lsr                     ; Shift right by 2 to get high byte
+        lsr
+        and #$3C                ; Mask to valid range (bits 10-13 become bits 2-5)
+        ; Wait, this is getting complicated. Let me do it differently.
+        
+        ; Actually: ($FF14 & $F8) directly gives screen_addr / 256 * 8
+        ; So screen_hi = ($FF14 & $F8) >> 2 = ($FF14 >> 2) & $3E
+        ; For $FF14 = $18: $18 >> 2 = $06, & $3E = $06. But we want $0C!
+        ; Hmm, let me recalculate...
+        
+        ; TED $FF14: bits 3-7 are address bits A10-A14
+        ; Screen address bit 10 = $FF14 bit 3
+        ; Screen address bit 14 = $FF14 bit 7
+        ; So screen address = ($FF14 & $F8) << 7 = ($FF14 & $F8) * 128
+        ; Which gives us: ($FF14 & $F8) >> 1 as the high byte
+        
+        lda ted_regs+$14
+        and #$F8
+        lsr                     ; Divide by 2 to get high byte of screen address
+        sta _p4_scr_addr_hi
+        
+        ; Now we need to point VIC-IV SCRNPTR at the right place
+        ; If screen is in $0000-$0FFF, we use LOW_RAM_BUFFER
+        ; If screen is in $1000+, we use Bank 5 directly
+        
+        cmp #$10                ; Is high byte >= $10 ($1000+)?
+        bcs _scr_in_bank5
+        
+        ; Screen is in $0000-$0FFF range - use LOW_RAM_BUFFER
+        ; VIC-IV address = LOW_RAM_BUFFER + screen_offset
+        ; LOW_RAM_BUFFER = $A000, so:
+        clc
+        adc #>LOW_RAM_BUFFER    ; Add $A0 to get $Axxx
+        sta $D061               ; SCRNPTR middle byte
+        lda #$00
+        sta $D060               ; SCRNPTR LSB = $00
+        sta $D062               ; SCRNPTR bank = 0
+        bra _scr_addr_done
+        
+_scr_in_bank5:
+        ; Screen is at $1000+ - point directly to Bank 5
+        ; VIC-IV address = $050000 + screen_addr
+        lda #$00
+        sta $D060               ; SCRNPTR LSB = $00
+        lda _p4_scr_addr_hi
+        sta $D061               ; SCRNPTR middle = screen high byte
+        lda #$05
+        sta $D062               ; SCRNPTR bank = 5
+
+_scr_addr_done:
+        rts
+
+_p4_scr_addr_hi: .byte 0
 
 ; ============================================================
 ; P4VID_CharsetChanged - Called when $FF12 or $FF13 is written

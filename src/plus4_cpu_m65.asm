@@ -43,6 +43,11 @@ P_N = %10000000
 p4_kbd_sel:          .byte $FF  ; Keyboard selector written to $FD30
 p4_joy_sel:          .byte $FF  ; Joystick selector written to $FF08
 
+; Debug trace variables
+p4_trace_enabled:    .byte $00  ; Set to 1 after LOAD to enable tracing
+p4_trace_pos_lo:     .byte $00  ; Screen position low byte
+p4_trace_pos_hi:     .byte $08  ; Screen position high byte ($0800)
+
 ; TED timing constants (PAL)
 TED_CYCLES_PER_LINE = 57    ; ~57 cycles per scanline
 TED_LINES_PER_FRAME = 312   ; PAL has 312 lines
@@ -88,6 +93,7 @@ p4_code_ptr       = $E0   ; 4 bytes: lo, hi, bank, megabyte
 p4_code_page_hi   = $E4   ; cached p4_pc_hi (guest)
 p4_code_valid     = $E5   ; 0=invalid, !=0 valid
 p4_code_romvis    = $E6   ; cached p4_rom_visible snapshot
+p4_hook_pc_changed = $E7  ; Set by hooks when they modify PC
 
 ; Call this when you want to force cache rebuild (optional helper)
 invalidate_code_cache:
@@ -256,6 +262,44 @@ pull_to_a:
         lda LOW_RAM_BUFFER+$0100,x             ; Stack is at LOW_RAM_BUFFER+100 - LOW_RAM_BUFFER+1FF
         rts
 
+; ============================================================
+; Fast ZP read/write - direct access to LOW_RAM_BUFFER
+; These skip the full P4MEM_Read/Write overhead for ZP ($00-$FF)
+; ============================================================
+
+; Read from ZP address in X, result in A
+read_zp_x:
+        lda LOW_RAM_BUFFER,x
+        rts
+
+; Read from ZP address in p4_addr_lo, result in A
+read_zp:
+        ldx p4_addr_lo
+        lda LOW_RAM_BUFFER,x
+        rts
+
+; Write A to ZP address in X
+write_zp_x:
+        sta LOW_RAM_BUFFER,x
+        rts
+
+; Write p4_data to ZP address in p4_addr_lo
+write_zp:
+        ldx p4_addr_lo
+        lda p4_data
+        sta LOW_RAM_BUFFER,x
+        rts
+
+; Read 16-bit pointer from ZP address Y, result in p4_addr_lo/hi
+; (Used for indirect addressing modes)
+read_zp_ptr_y:
+        lda LOW_RAM_BUFFER,y
+        sta p4_addr_lo
+        iny
+        lda LOW_RAM_BUFFER,y
+        sta p4_addr_hi
+        rts
+
 ; --- Addressing modes ---
 addr_zp:
         jsr fetch8
@@ -319,41 +363,27 @@ addr_indx:
         jsr fetch8
         clc
         adc p4_x
-        tay
-        sty p4_addr_lo
-        lda #$00
-        sta p4_addr_hi
-        jsr P4MEM_Read
-        sta p4_tmp
+        tay                             ; Y = ZP address
+        ; Read 16-bit pointer directly from ZP
+        lda LOW_RAM_BUFFER,y
+        sta p4_addr_lo
         iny
-        tya
-        sta p4_addr_lo
-        lda #$00
-        sta p4_addr_hi
-        jsr P4MEM_Read
-        sta p4_tmp2
-        lda p4_tmp
-        sta p4_addr_lo
-        lda p4_tmp2
+        lda LOW_RAM_BUFFER,y
         sta p4_addr_hi
         rts
 
 addr_indy:
         jsr fetch8
-        tay
+        tay                             ; Y = ZP address
         lda #$00
         sta p4_xtra
-        sty p4_addr_lo
-        sta p4_addr_hi
-        jsr P4MEM_Read
+        ; Read 16-bit pointer directly from ZP
+        lda LOW_RAM_BUFFER,y
         sta p4_tmp
         iny
-        tya
-        sta p4_addr_lo
-        lda #$00
-        sta p4_addr_hi
-        jsr P4MEM_Read
+        lda LOW_RAM_BUFFER,y
         sta p4_tmp2
+        ; Add Y register to form final address
         lda p4_tmp
         clc
         adc p4_y
@@ -361,6 +391,7 @@ addr_indy:
         lda p4_tmp2
         adc #$00
         sta p4_addr_hi
+        ; Check for page crossing
         lda p4_tmp
         clc
         adc p4_y
@@ -400,26 +431,10 @@ fetch_rel:
 
 ; Batched TED Timing
 ; ============================================================
-; Quick cycle accumulator - called after every opcode
-; Only does full TED processing when we hit a scanline boundary
+; TED processing - called when cycle accumulator >= 57
 ; ============================================================
-finish_cycles:
-        ; Add base cycles + extra cycles
-        clc
-        adc p4_xtra
-        
-        ; Quick accumulate - no JSR overhead
-        clc
-        adc ted_cycle_accum
-        sta ted_cycle_accum
-        
-        ; Check if we've completed a scanline (57+ cycles)
-        cmp #TED_CYCLES_PER_LINE
-        bcs _finish_do_ted
-        rts
-
-_finish_do_ted:
-        ; Only now do the expensive TED processing
+finish_do_ted:
+        ; Process complete scanlines
 
 _ted_line_loop:
         ; Subtract one scanline
@@ -638,6 +653,21 @@ cpu_take_nmi:
 
 ; --- Reset/Step ---
 P4CPU_Reset:
+        ; Reset video mode first (before any other state)
+        lda #0
+        sta p4_video_mode
+        sta p4_file_op_active
+        
+        ; Re-initialize memory system (clears RAM, TED regs, etc.)
+        jsr P4MEM_Init
+        
+        ; Re-initialize video 
+        jsr P4MEM_InitVideo
+        
+        ; Reset hook state
+        jsr P4HOOK_Reset
+        
+        ; Reset CPU registers
         lda #$00
         sta p4_a
         sta p4_x
@@ -652,6 +682,8 @@ P4CPU_Reset:
         sta p4_sp
         lda #(P_I|P_U)
         sta p4_p
+        
+        ; Get reset vector from ROM
         lda #$fc
         sta p4_addr_lo
         lda #$ff
@@ -664,7 +696,46 @@ P4CPU_Reset:
         sta p4_pc_hi
         rts
 
+; ============================================================
+; Trace/breakpoint for debugging
+; ============================================================
+TRACE_ENABLED = 1       ; Set to 0 to disable breakpoint
+
+; Breakpoint address - halt when PC hits this
+BREAK_ADDR_LO = $00
+BREAK_ADDR_HI = $FD     ; Break at $FD00
+
+; ============================================================
+; P4CPU_StepMultiple - Execute multiple instructions
+; Simple batch version - calls P4CPU_Step repeatedly
+; ============================================================
+BATCH_SIZE = 64         ; Number of instructions per batch
+
+P4CPU_StepMultiple:
+        ; Check monitor ONCE per batch, not per instruction
+        jsr P4MON_Check
+        bcs _sm_monitor_active  ; Monitor took over, skip batch
+        
+        ldx #BATCH_SIZE
+_sm_batch_loop:
+        phx                     ; Save counter
+        jsr P4CPU_Step
+        plx                     ; Restore counter
+        dex
+        bne _sm_batch_loop
+_sm_monitor_active:
+        rts
+
+; ============================================================
+; P4CPU_Step - Single instruction execution
+; ============================================================
 P4CPU_Step:
+        ; DEBUG TRACE DISABLED
+        ; lda p4_trace_enabled
+        ; beq _skip_trace
+        ; ... trace code ...
+        
+_skip_trace:
         ; --------------------------------------------------------
         ; Check for pending interrupts (NMI first, then IRQ)
         ; --------------------------------------------------------
@@ -673,62 +744,158 @@ P4CPU_Step:
         lda #0
         sta p4_nmi_pending
         jsr cpu_take_nmi
-        lda #7                  ; NMI takes 7 cycles
+        lda #7
         jmp finish_cycles
-
+        
 _step_chk_irq:
         lda p4_irq_pending
         beq _step_execute
-        ; Check if IRQ is masked (I flag set)
         lda p4_p
         and #P_I
-        bne _step_execute       ; I=1, IRQ masked, skip
-
-; ---- DEBUG: dump vectors once, right before first IRQ taken ----
-        ; Take IRQ
+        bne _step_execute       ; I=1, IRQ masked
+        
         lda #0
         sta p4_irq_pending
         jsr cpu_take_irq
-        lda #7                  ; IRQ takes 7 cycles
+        lda #7
         jmp finish_cycles
 
 _step_execute:
         lda #$00
         sta p4_xtra
+        
+        ; Save instruction PC for debugging
         lda p4_pc_lo
         sta p4_inst_pc_lo
         lda p4_pc_hi
         sta p4_inst_pc_hi
 
+        ; Check breakpoint BEFORE we fetch/execute
+.if TRACE_ENABLED
+        lda p4_inst_pc_hi
+        cmp #BREAK_ADDR_HI
+        bne _no_break
+        lda p4_inst_pc_lo
+        cmp #BREAK_ADDR_LO
+        bne _no_break
+        ; Hit breakpoint! Halt with red border
+        lda #$02
+        sta $d020
+_break_halt:
+        jmp _break_halt
+_no_break:
+.endif
+
         ; --------------------------------------------------------
-        ; BASIC/KERNAL hooks (host-side traps)
+        ; BASIC/KERNAL hooks - only for ROM area ($8000+)
         ; --------------------------------------------------------
+        lda p4_pc_hi
+        bpl _step_fetch         ; Skip hooks if PC < $8000
+        
+        ; Clear hook PC changed flag before calling hooks
+        lda #0
+        sta p4_hook_pc_changed
+        
         jsr P4HOOK_CheckAndRun
         
+        ; Check if hook modified PC - if so, invalidate code cache
+        lda p4_hook_pc_changed
+        beq _step_fetch
+        lda #0
+        sta p4_code_valid       ; Force code cache rebuild
+        
+_step_fetch:
         ; --------------------------------------------------------
-        ; Fetch/decode/execute
+        ; Fetch opcode and dispatch
         ; --------------------------------------------------------
         jsr fetch8
+        asl                     ; opcode * 2, carry set if opcode >= $80
         tax
+        bcc _step_dispatch_lo
+        jmp (op_table_hi,x)     ; opcodes $80-$FF
+_step_dispatch_lo:
+        jmp (op_table_lo,x)     ; opcodes $00-$7F
+
+; ============================================================
+; finish_cycles - Handles cycle accounting, returns with RTS
+; A = base cycle count on entry
+; ============================================================
+finish_cycles:
+        ; Add extra cycles
+        clc
+        adc p4_xtra
         
-        ; Get handler address
-        lda op_vec_lo,x
-        sta p4_vec_lo
-        lda op_vec_hi,x
-        sta p4_vec_hi
+        ; Accumulate cycles
+        clc
+        adc ted_cycle_accum
+        sta ted_cycle_accum
         
-        ; Execute
-        jmp (p4_vec_lo)
+        ; Check if we've completed a scanline (57+ cycles)
+        cmp #TED_CYCLES_PER_LINE
+        bcc _fc_done
+        
+        ; Need TED processing
+        jsr finish_do_ted
+
+_fc_done:
+        rts
 
 op_illegal:
-        lda #$00
+        ; Store PC values immediately in safe locations
+        lda p4_inst_pc_hi
+        sta _ill_pc_hi
+        lda p4_inst_pc_lo
+        sta _ill_pc_lo
+        
+        ; RED border = entered handler
+        lda #$02
+        sta $d020
+        jsr _ill_long_delay
+        
+        ; YELLOW = about to show PC hi
+        lda #$07
+        sta $d020
+        jsr _ill_long_delay
+        
+        ; Show PC high byte as border color
+        lda _ill_pc_hi
+        sta $d020
+        jsr _ill_long_delay
+        
+        ; CYAN = about to show PC lo
+        lda #$03
+        sta $d020
+        jsr _ill_long_delay
+        
+        ; Show PC low byte as border color
+        lda _ill_pc_lo
+        sta $d020
+        jsr _ill_long_delay
+
+        ; WHITE = done, about to halt
+        lda #$01
         sta $d020
 
-        ; monitor
-        ; Force ROM visible for BRK handler
-        lda #1
-        sta p4_rom_visible
-        jmp op_00
+_ill_halt:
+        jmp _ill_halt
+
+_ill_pc_hi: .byte 0
+_ill_pc_lo: .byte 0
+
+_ill_long_delay:
+        ldx #0
+_ill_d1:
+        ldy #0
+_ill_d2:
+        nop
+        nop
+        nop
+        nop
+        dey
+        bne _ill_d2
+        dex
+        bne _ill_d1
+        rts
 
 ; --- branch_do ---
 branch_do:
@@ -1145,8 +1312,10 @@ op_01:
 
 ; $05 ORA zp
 op_05:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized ORA zp
+        jsr fetch8
+        tax
+        lda LOW_RAM_BUFFER,x
         ora p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1156,23 +1325,19 @@ op_05:
 
 ; $06 ASL zp
 op_06:
-        jsr addr_zp
-        jsr P4MEM_Read
-        asl
-        php
-        sta p4_data
-        jsr P4MEM_Write
+        jsr fetch8
+        tax
+        ; ASL directly in LOW_RAM_BUFFER
+        asl LOW_RAM_BUFFER,x
+        ; Update carry flag
         lda p4_p
         and #(~P_C) & $ff
-        sta p4_p
-        plp
         bcc _op06_nc
-        lda p4_p
         ora #P_C
-        sta p4_p
 _op06_nc:
-        lda p4_data
-        ;jsr set_zn_a
+        sta p4_p
+        ; Set N/Z from result
+        lda LOW_RAM_BUFFER,x
         #set_zna
         lda #5
         jmp finish_cycles
@@ -1284,8 +1449,12 @@ op_11:
 
 ; $15 ORA zp,X
 op_15:
-        jsr addr_zpx
-        jsr P4MEM_Read
+        ; Optimized ORA zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        lda LOW_RAM_BUFFER,x
         ora p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1295,23 +1464,22 @@ op_15:
 
 ; $16 ASL zp,X
 op_16:
-        jsr addr_zpx
-        jsr P4MEM_Read
-        asl
-        php
-        sta p4_data
-        jsr P4MEM_Write
+        ; Optimized ASL zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        ; ASL directly in LOW_RAM_BUFFER
+        asl LOW_RAM_BUFFER,x
+        ; Update carry flag
         lda p4_p
         and #(~P_C) & $ff
-        sta p4_p
-        plp
         bcc _op16_nc
-        lda p4_p
         ora #P_C
-        sta p4_p
 _op16_nc:
-        lda p4_data
-        ;jsr set_zn_a
+        sta p4_p
+        ; Set N/Z from result
+        lda LOW_RAM_BUFFER,x
         #set_zna
         lda #6
         jmp finish_cycles
@@ -1407,8 +1575,10 @@ op_21:
 
 ; $24 BIT zp
 op_24:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized BIT zp
+        jsr fetch8
+        tax
+        lda LOW_RAM_BUFFER,x
         sta p4_tmp
         lda p4_p
         and #(~(P_N|P_V|P_Z)) & $ff
@@ -1433,8 +1603,10 @@ _op24_nz:
 
 ; $25 AND zp
 op_25:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized AND zp
+        jsr fetch8
+        tax
+        lda LOW_RAM_BUFFER,x
         and p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1444,29 +1616,31 @@ op_25:
 
 ; $26 ROL zp
 op_26:
-        jsr addr_zp
-        jsr P4MEM_Read
-        sta p4_tmp
+        jsr fetch8
+        tax
+        ; Get old carry into bit 0 position
         lda p4_p
         and #P_C
         sta p4_tmp2
-        lda p4_tmp
+        ; Get memory, save bit 7 for new carry
+        lda LOW_RAM_BUFFER,x
+        sta p4_tmp
+        ; Shift left and OR in old carry
         asl
         ora p4_tmp2
-        sta p4_data
+        sta LOW_RAM_BUFFER,x
+        ; Update carry from old bit 7
         lda p4_p
         and #(~P_C) & $ff
         sta p4_p
         lda p4_tmp
-        and #$80
-        beq _op26_nc
+        bpl _op26_nc
         lda p4_p
         ora #P_C
         sta p4_p
 _op26_nc:
-        jsr P4MEM_Write
-        lda p4_data
-        ;jsr set_zn_a
+        ; Set N/Z from result
+        lda LOW_RAM_BUFFER,x
         #set_zna
         lda #5
         jmp finish_cycles
@@ -1615,8 +1789,12 @@ op_31:
 
 ; $35 AND zp,X
 op_35:
-        jsr addr_zpx
-        jsr P4MEM_Read
+        ; Optimized AND zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        lda LOW_RAM_BUFFER,x
         and p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1626,29 +1804,34 @@ op_35:
 
 ; $36 ROL zp,X
 op_36:
-        jsr addr_zpx
-        jsr P4MEM_Read
-        sta p4_tmp
+        ; Optimized ROL zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        ; Get old carry into bit 0 position
         lda p4_p
         and #P_C
         sta p4_tmp2
-        lda p4_tmp
+        ; Get memory, save bit 7 for new carry
+        lda LOW_RAM_BUFFER,x
+        sta p4_tmp
+        ; Shift left and OR in old carry
         asl
         ora p4_tmp2
-        sta p4_data
+        sta LOW_RAM_BUFFER,x
+        ; Update carry from old bit 7
         lda p4_p
         and #(~P_C) & $ff
         sta p4_p
         lda p4_tmp
-        and #$80
-        beq _op36_nc
+        bpl _op36_nc
         lda p4_p
         ora #P_C
         sta p4_p
 _op36_nc:
-        jsr P4MEM_Write
-        lda p4_data
-        ;jsr set_zn_a
+        ; Set N/Z from result
+        lda LOW_RAM_BUFFER,x
         #set_zna
         lda #6
         jmp finish_cycles
@@ -1738,8 +1921,10 @@ op_41:
 
 ; $45 EOR zp
 op_45:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized EOR zp
+        jsr fetch8
+        tax
+        lda LOW_RAM_BUFFER,x
         eor p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1749,24 +1934,21 @@ op_45:
 
 ; $46 LSR zp
 op_46:
-        jsr addr_zp
-        jsr P4MEM_Read
-        sta p4_tmp
+        jsr fetch8
+        tax
+        ; Check bit 0 for carry before shift
+        lda LOW_RAM_BUFFER,x
         lsr
-        sta p4_data
+        sta LOW_RAM_BUFFER,x
+        ; Update carry - carry flag is already set correctly by LSR
         lda p4_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
-        and #$01
-        beq _op46_nc
-        lda p4_p
+        bcc _op46_nc
         ora #P_C
-        sta p4_p
 _op46_nc:
-        jsr P4MEM_Write
-        lda p4_data
-        ;jsr set_zn_a
+        sta p4_p
+        ; Set N/Z from result
+        lda LOW_RAM_BUFFER,x
         #set_zna
         lda #5
         jmp finish_cycles
@@ -1889,8 +2071,12 @@ op_51:
 
 ; $55 EOR zp,X
 op_55:
-        jsr addr_zpx
-        jsr P4MEM_Read
+        ; Optimized EOR zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        lda LOW_RAM_BUFFER,x
         eor p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1900,24 +2086,24 @@ op_55:
 
 ; $56 LSR zp,X
 op_56:
-        jsr addr_zpx
-        jsr P4MEM_Read
-        sta p4_tmp
+        ; Optimized LSR zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        ; Shift right directly
+        lda LOW_RAM_BUFFER,x
         lsr
-        sta p4_data
+        sta LOW_RAM_BUFFER,x
+        ; Update carry - carry flag already set by LSR
         lda p4_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
-        and #$01
-        beq _op56_nc
-        lda p4_p
+        bcc _op56_nc
         ora #P_C
-        sta p4_p
 _op56_nc:
-        jsr P4MEM_Write
-        lda p4_data
-        ;jsr set_zn_a
+        sta p4_p
+        ; Set N/Z from result
+        lda LOW_RAM_BUFFER,x
         #set_zna
         lda #6
         jmp finish_cycles
@@ -1982,10 +2168,7 @@ op_60:
         sta p4_pc_lo
         jsr pull_to_a
         sta p4_pc_hi
-        inc p4_pc_lo
-        bne _op60_done
-        inc p4_pc_hi
-_op60_done:
+        inw p4_pc_lo            ; 16-bit increment
         lda #6
         jmp finish_cycles
 
@@ -1999,31 +2182,37 @@ op_61:
 
 ; $65 ADC zp
 op_65:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized ADC zp
+        jsr fetch8
+        tax
+        lda LOW_RAM_BUFFER,x
         jsr do_adc
         lda #3
         jmp finish_cycles
 
 ; $66 ROR zp
 op_66:
-        jsr addr_zp
-        jsr P4MEM_Read
-        sta p4_tmp
+        jsr fetch8
+        tax
+        ; Get old carry into bit 7 position
         lda p4_p
         and #P_C
         beq _op66_nci
         lda #$80
         sta p4_tmp2
-        jmp _op66_do
+        bra _op66_do
 _op66_nci:
         lda #$00
         sta p4_tmp2
 _op66_do:
-        lda p4_tmp
+        ; Get memory, save bit 0 for new carry
+        lda LOW_RAM_BUFFER,x
+        sta p4_tmp
+        ; Shift right and OR in old carry
         lsr
         ora p4_tmp2
-        sta p4_data
+        sta LOW_RAM_BUFFER,x
+        ; Update carry from old bit 0
         lda p4_p
         and #(~P_C) & $ff
         sta p4_p
@@ -2034,9 +2223,8 @@ _op66_do:
         ora #P_C
         sta p4_p
 _op66_nc:
-        jsr P4MEM_Write
-        lda p4_data
-        ;jsr set_zn_a
+        ; Set N/Z from result
+        lda LOW_RAM_BUFFER,x
         #set_zna
         lda #5
         jmp finish_cycles
@@ -2175,31 +2363,42 @@ op_71:
 
 ; $75 ADC zp,X
 op_75:
-        jsr addr_zpx
-        jsr P4MEM_Read
+        ; Optimized ADC zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        lda LOW_RAM_BUFFER,x
         jsr do_adc
         lda #4
         jmp finish_cycles
 
 ; $76 ROR zp,X
 op_76:
-        jsr addr_zpx
-        jsr P4MEM_Read
-        sta p4_tmp
+        ; Optimized ROR zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        ; Get old carry into bit 7 position
         lda p4_p
         and #P_C
         beq _op76_nci
         lda #$80
         sta p4_tmp2
-        jmp _op76_do
+        bra _op76_do
 _op76_nci:
         lda #$00
         sta p4_tmp2
 _op76_do:
-        lda p4_tmp
+        ; Get memory, save bit 0 for new carry
+        lda LOW_RAM_BUFFER,x
+        sta p4_tmp
+        ; Shift right and OR in old carry
         lsr
         ora p4_tmp2
-        sta p4_data
+        sta LOW_RAM_BUFFER,x
+        ; Update carry from old bit 0
         lda p4_p
         and #(~P_C) & $ff
         sta p4_p
@@ -2210,9 +2409,8 @@ _op76_do:
         ora #P_C
         sta p4_p
 _op76_nc:
-        jsr P4MEM_Write
-        lda p4_data
-        ;jsr set_zn_a
+        ; Set N/Z from result
+        lda LOW_RAM_BUFFER,x
         #set_zna
         lda #6
         jmp finish_cycles
@@ -2415,28 +2613,37 @@ op_91:
 
 ; $94 STY zp,X
 op_94:
-        jsr addr_zpx
+        ; Optimized STY zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
         lda p4_y
-        sta p4_data
-        jsr P4MEM_Write
+        sta LOW_RAM_BUFFER,x
         lda #4
         jmp finish_cycles
 
 ; $95 STA zp,X
 op_95:
-        jsr addr_zpx
+        ; Optimized STA zp,X - direct access to LOW_RAM_BUFFER
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
         lda p4_a
-        sta p4_data
-        jsr P4MEM_Write
+        sta LOW_RAM_BUFFER,x
         lda #4
         jmp finish_cycles
 
 ; $96 STX zp,Y
 op_96:
-        jsr addr_zpy
+        ; Optimized STX zp,Y - direct access to LOW_RAM_BUFFER
+        jsr fetch8
+        clc
+        adc p4_y
+        tax
         lda p4_x
-        sta p4_data
-        jsr P4MEM_Write
+        sta LOW_RAM_BUFFER,x
         lda #4
         jmp finish_cycles
 
@@ -2627,8 +2834,12 @@ op_b1:
 
 ; $B4 LDY zp,X
 op_b4:
-        jsr addr_zpx
-        jsr P4MEM_Read
+        ; Optimized LDY zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        lda LOW_RAM_BUFFER,x
         sta p4_y
         ;jsr set_zn_a
         #set_zna
@@ -2637,8 +2848,12 @@ op_b4:
 
 ; $B5 LDA zp,X
 op_b5:
-        jsr addr_zpx
-        jsr P4MEM_Read
+        ; Optimized LDA zp,X - direct access to LOW_RAM_BUFFER
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        lda LOW_RAM_BUFFER,x
         sta p4_a
         ;jsr set_zn_a
         #set_zna
@@ -2647,8 +2862,12 @@ op_b5:
 
 ; $B6 LDX zp,Y
 op_b6:
-        jsr addr_zpy
-        jsr P4MEM_Read
+        ; Optimized LDX zp,Y - direct access to LOW_RAM_BUFFER
+        jsr fetch8
+        clc
+        adc p4_y
+        tax
+        lda LOW_RAM_BUFFER,x
         sta p4_x
         ;jsr set_zn_a
         #set_zna
@@ -2729,16 +2948,20 @@ op_c1:
 
 ; $C4 CPY zp
 op_c4:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized CPY zp
+        jsr fetch8
+        tax
+        lda LOW_RAM_BUFFER,x
         jsr do_cpy
         lda #3
         jmp finish_cycles
 
 ; $C5 CMP zp
 op_c5:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized CMP zp
+        jsr fetch8
+        tax
+        lda LOW_RAM_BUFFER,x
         jsr do_cmp
         lda #3
         jmp finish_cycles
@@ -2840,21 +3063,25 @@ op_d1:
 
 ; $D5 CMP zp,X
 op_d5:
-        jsr addr_zpx
-        jsr P4MEM_Read
+        ; Optimized CMP zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        lda LOW_RAM_BUFFER,x
         jsr do_cmp
         lda #4
         jmp finish_cycles
 
 ; $D6 DEC zp,X
 op_d6:
-        jsr addr_zpx
-        jsr P4MEM_Read
-        sec
-        sbc #1
-        sta p4_data
-        jsr P4MEM_Write
-        lda p4_data
+        ; Optimized DEC zp,X - direct access to LOW_RAM_BUFFER
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        dec LOW_RAM_BUFFER,x
+        lda LOW_RAM_BUFFER,x
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -2915,16 +3142,20 @@ op_e1:
 
 ; $E4 CPX zp
 op_e4:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized CPX zp
+        jsr fetch8
+        tax
+        lda LOW_RAM_BUFFER,x
         jsr do_cpx
         lda #3
         jmp finish_cycles
 
 ; $E5 SBC zp
 op_e5:
-        jsr addr_zp
-        jsr P4MEM_Read
+        ; Optimized SBC zp
+        jsr fetch8
+        tax
+        lda LOW_RAM_BUFFER,x
         jsr do_sbc
         lda #3
         jmp finish_cycles
@@ -3022,21 +3253,25 @@ op_f1:
 
 ; $F5 SBC zp,X
 op_f5:
-        jsr addr_zpx
-        jsr P4MEM_Read
+        ; Optimized SBC zp,X
+        jsr fetch8
+        clc
+        adc p4_x
+        tax
+        lda LOW_RAM_BUFFER,x
         jsr do_sbc
         lda #4
         jmp finish_cycles
 
 ; $F6 INC zp,X
 op_f6:
-        jsr addr_zpx
-        jsr P4MEM_Read
+        ; Optimized INC zp,X - direct access to LOW_RAM_BUFFER
+        jsr fetch8
         clc
-        adc #1
-        sta p4_data
-        jsr P4MEM_Write
-        lda p4_data
+        adc p4_x
+        tax
+        inc LOW_RAM_BUFFER,x
+        lda LOW_RAM_BUFFER,x
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -3081,72 +3316,120 @@ op_fe:
         jmp finish_cycles
 
 ; ============================================================
-; Illegal opcodes - all point to op_illegal
+; Illegal opcodes
+; Many programs rely on these - implement common ones as NOPs
 ; ============================================================
-op_02: jmp op_illegal
+
+; NOP zp (2 bytes) - $04, $44, $64
+op_04:
+op_44:
+op_64:
+        jsr fetch8              ; Skip the ZP byte
+        lda #3
+        jmp finish_cycles
+
+; NOP abs (3 bytes) - $0C
+op_0c:
+        jsr fetch8              ; Skip low byte
+        jsr fetch8              ; Skip high byte
+        lda #4
+        jmp finish_cycles
+
+; NOP abs,X (3 bytes) - $1C, $3C, $5C, $7C, $DC, $FC
+op_1c:
+op_3c:
+op_5c:
+op_7c:
+op_dc:
+op_fc:
+        jsr fetch8              ; Skip low byte
+        jsr fetch8              ; Skip high byte
+        lda #4
+        jmp finish_cycles
+
+; NOP zp,X (2 bytes) - $14, $34, $54, $74, $D4, $F4
+op_14:
+op_34:
+op_54:
+op_74:
+op_d4:
+op_f4:
+        jsr fetch8              ; Skip the ZP byte
+        lda #4
+        jmp finish_cycles
+
+; NOP implied (1 byte) - $1A, $3A, $5A, $7A, $DA, $FA
+op_1a:
+op_3a:
+op_5a:
+op_7a:
+op_da:
+op_fa:
+        lda #2
+        jmp finish_cycles
+
+; NOP immediate (2 bytes) - $80, $82, $89, $C2, $E2
+op_80:
+op_82:
+op_89:
+op_c2:
+op_e2:
+        jsr fetch8              ; Skip immediate byte
+        lda #2
+        jmp finish_cycles
+
+; JAM/KIL - halt CPU (these will crash if hit)
+op_02:
+op_12:
+op_22:
+op_32:
+op_42:
+op_52:
+op_62:
+op_72:
+op_92:
+op_b2:
+op_d2:
+op_f2:
+        jmp op_illegal
+
+; Remaining illegal opcodes - jump to illegal handler
 op_03: jmp op_illegal
-op_04: jmp op_illegal
 op_07: jmp op_illegal
 op_0b: jmp op_illegal
-op_0c: jmp op_illegal
 op_0f: jmp op_illegal
-op_12: jmp op_illegal
 op_13: jmp op_illegal
-op_14: jmp op_illegal
 op_17: jmp op_illegal
-op_1a: jmp op_illegal
 op_1b: jmp op_illegal
-op_1c: jmp op_illegal
 op_1f: jmp op_illegal
-op_22: jmp op_illegal
 op_23: jmp op_illegal
 op_27: jmp op_illegal
 op_2b: jmp op_illegal
 op_2f: jmp op_illegal
-op_32: jmp op_illegal
 op_33: jmp op_illegal
-op_34: jmp op_illegal
 op_37: jmp op_illegal
-op_3a: jmp op_illegal
 op_3b: jmp op_illegal
-op_3c: jmp op_illegal
 op_3f: jmp op_illegal
-op_42: jmp op_illegal
 op_43: jmp op_illegal
-op_44: jmp op_illegal
 op_47: jmp op_illegal
 op_4b: jmp op_illegal
 op_4f: jmp op_illegal
-op_52: jmp op_illegal
 op_53: jmp op_illegal
-op_54: jmp op_illegal
 op_57: jmp op_illegal
-op_5a: jmp op_illegal
 op_5b: jmp op_illegal
-op_5c: jmp op_illegal
 op_5f: jmp op_illegal
-op_62: jmp op_illegal
 op_63: jmp op_illegal
-op_64: jmp op_illegal
 op_67: jmp op_illegal
 op_6b: jmp op_illegal
 op_6f: jmp op_illegal
-op_72: jmp op_illegal
 op_73: jmp op_illegal
-op_74: jmp op_illegal
 op_77: jmp op_illegal
-op_7a: jmp op_illegal
 op_7b: jmp op_illegal
-op_7c: jmp op_illegal
 op_7f: jmp op_illegal
-op_80: jmp op_illegal
-op_82: jmp op_illegal
 op_83: jmp op_illegal
 op_87: jmp op_illegal
-op_89: jmp op_illegal
 op_8b: jmp op_illegal
 op_8f: jmp op_illegal
-op_92: jmp op_illegal
 op_93: jmp op_illegal
 op_97: jmp op_illegal
 op_9b: jmp op_illegal
@@ -3157,36 +3440,25 @@ op_a3: jmp op_illegal
 op_a7: jmp op_illegal
 op_ab: jmp op_illegal
 op_af: jmp op_illegal
-op_b2: jmp op_illegal
 op_b3: jmp op_illegal
 op_b7: jmp op_illegal
 op_bb: jmp op_illegal
 op_bf: jmp op_illegal
-op_c2: jmp op_illegal
 op_c3: jmp op_illegal
 op_c7: jmp op_illegal
 op_cb: jmp op_illegal
 op_cf: jmp op_illegal
-op_d2: jmp op_illegal
 op_d3: jmp op_illegal
-op_d4: jmp op_illegal
 op_d7: jmp op_illegal
-op_da: jmp op_illegal
 op_db: jmp op_illegal
-op_dc: jmp op_illegal
 op_df: jmp op_illegal
-op_e2: jmp op_illegal
 op_e3: jmp op_illegal
 op_e7: jmp op_illegal
 op_eb: jmp op_illegal
 op_ef: jmp op_illegal
-op_f2: jmp op_illegal
 op_f3: jmp op_illegal
-op_f4: jmp op_illegal
 op_f7: jmp op_illegal
-op_fa: jmp op_illegal
 op_fb: jmp op_illegal
-op_fc: jmp op_illegal
 op_ff: jmp op_illegal
 
 
@@ -3194,70 +3466,43 @@ op_ff: jmp op_illegal
 ; Opcode vector tables (split for fast indexing)
 ; ============================================================
 
-op_vec_lo:
-        .byte <op_00, <op_01, <op_02, <op_03, <op_04, <op_05, <op_06, <op_07
-        .byte <op_08, <op_09, <op_0a, <op_0b, <op_0c, <op_0d, <op_0e, <op_0f
-        .byte <op_10, <op_11, <op_12, <op_13, <op_14, <op_15, <op_16, <op_17
-        .byte <op_18, <op_19, <op_1a, <op_1b, <op_1c, <op_1d, <op_1e, <op_1f
-        .byte <op_20, <op_21, <op_22, <op_23, <op_24, <op_25, <op_26, <op_27
-        .byte <op_28, <op_29, <op_2a, <op_2b, <op_2c, <op_2d, <op_2e, <op_2f
-        .byte <op_30, <op_31, <op_32, <op_33, <op_34, <op_35, <op_36, <op_37
-        .byte <op_38, <op_39, <op_3a, <op_3b, <op_3c, <op_3d, <op_3e, <op_3f
-        .byte <op_40, <op_41, <op_42, <op_43, <op_44, <op_45, <op_46, <op_47
-        .byte <op_48, <op_49, <op_4a, <op_4b, <op_4c, <op_4d, <op_4e, <op_4f
-        .byte <op_50, <op_51, <op_52, <op_53, <op_54, <op_55, <op_56, <op_57
-        .byte <op_58, <op_59, <op_5a, <op_5b, <op_5c, <op_5d, <op_5e, <op_5f
-        .byte <op_60, <op_61, <op_62, <op_63, <op_64, <op_65, <op_66, <op_67
-        .byte <op_68, <op_69, <op_6a, <op_6b, <op_6c, <op_6d, <op_6e, <op_6f
-        .byte <op_70, <op_71, <op_72, <op_73, <op_74, <op_75, <op_76, <op_77
-        .byte <op_78, <op_79, <op_7a, <op_7b, <op_7c, <op_7d, <op_7e, <op_7f
-        .byte <op_80, <op_81, <op_82, <op_83, <op_84, <op_85, <op_86, <op_87
-        .byte <op_88, <op_89, <op_8a, <op_8b, <op_8c, <op_8d, <op_8e, <op_8f
-        .byte <op_90, <op_91, <op_92, <op_93, <op_94, <op_95, <op_96, <op_97
-        .byte <op_98, <op_99, <op_9a, <op_9b, <op_9c, <op_9d, <op_9e, <op_9f
-        .byte <op_a0, <op_a1, <op_a2, <op_a3, <op_a4, <op_a5, <op_a6, <op_a7
-        .byte <op_a8, <op_a9, <op_aa, <op_ab, <op_ac, <op_ad, <op_ae, <op_af
-        .byte <op_b0, <op_b1, <op_b2, <op_b3, <op_b4, <op_b5, <op_b6, <op_b7
-        .byte <op_b8, <op_b9, <op_ba, <op_bb, <op_bc, <op_bd, <op_be, <op_bf
-        .byte <op_c0, <op_c1, <op_c2, <op_c3, <op_c4, <op_c5, <op_c6, <op_c7
-        .byte <op_c8, <op_c9, <op_ca, <op_cb, <op_cc, <op_cd, <op_ce, <op_cf
-        .byte <op_d0, <op_d1, <op_d2, <op_d3, <op_d4, <op_d5, <op_d6, <op_d7
-        .byte <op_d8, <op_d9, <op_da, <op_db, <op_dc, <op_dd, <op_de, <op_df
-        .byte <op_e0, <op_e1, <op_e2, <op_e3, <op_e4, <op_e5, <op_e6, <op_e7
-        .byte <op_e8, <op_e9, <op_ea, <op_eb, <op_ec, <op_ed, <op_ee, <op_ef
-        .byte <op_f0, <op_f1, <op_f2, <op_f3, <op_f4, <op_f5, <op_f6, <op_f7
-        .byte <op_f8, <op_f9, <op_fa, <op_fb, <op_fc, <op_fd, <op_fe, <op_ff
+; Two 128-entry word tables for jmp (table,x) dispatch
+; op_table_lo handles opcodes $00-$7F
+; op_table_hi handles opcodes $80-$FF
+; X register = (opcode * 2) & $FF
 
-op_vec_hi:
-        .byte >op_00, >op_01, >op_02, >op_03, >op_04, >op_05, >op_06, >op_07
-        .byte >op_08, >op_09, >op_0a, >op_0b, >op_0c, >op_0d, >op_0e, >op_0f
-        .byte >op_10, >op_11, >op_12, >op_13, >op_14, >op_15, >op_16, >op_17
-        .byte >op_18, >op_19, >op_1a, >op_1b, >op_1c, >op_1d, >op_1e, >op_1f
-        .byte >op_20, >op_21, >op_22, >op_23, >op_24, >op_25, >op_26, >op_27
-        .byte >op_28, >op_29, >op_2a, >op_2b, >op_2c, >op_2d, >op_2e, >op_2f
-        .byte >op_30, >op_31, >op_32, >op_33, >op_34, >op_35, >op_36, >op_37
-        .byte >op_38, >op_39, >op_3a, >op_3b, >op_3c, >op_3d, >op_3e, >op_3f
-        .byte >op_40, >op_41, >op_42, >op_43, >op_44, >op_45, >op_46, >op_47
-        .byte >op_48, >op_49, >op_4a, >op_4b, >op_4c, >op_4d, >op_4e, >op_4f
-        .byte >op_50, >op_51, >op_52, >op_53, >op_54, >op_55, >op_56, >op_57
-        .byte >op_58, >op_59, >op_5a, >op_5b, >op_5c, >op_5d, >op_5e, >op_5f
-        .byte >op_60, >op_61, >op_62, >op_63, >op_64, >op_65, >op_66, >op_67
-        .byte >op_68, >op_69, >op_6a, >op_6b, >op_6c, >op_6d, >op_6e, >op_6f
-        .byte >op_70, >op_71, >op_72, >op_73, >op_74, >op_75, >op_76, >op_77
-        .byte >op_78, >op_79, >op_7a, >op_7b, >op_7c, >op_7d, >op_7e, >op_7f
-        .byte >op_80, >op_81, >op_82, >op_83, >op_84, >op_85, >op_86, >op_87
-        .byte >op_88, >op_89, >op_8a, >op_8b, >op_8c, >op_8d, >op_8e, >op_8f
-        .byte >op_90, >op_91, >op_92, >op_93, >op_94, >op_95, >op_96, >op_97
-        .byte >op_98, >op_99, >op_9a, >op_9b, >op_9c, >op_9d, >op_9e, >op_9f
-        .byte >op_a0, >op_a1, >op_a2, >op_a3, >op_a4, >op_a5, >op_a6, >op_a7
-        .byte >op_a8, >op_a9, >op_aa, >op_ab, >op_ac, >op_ad, >op_ae, >op_af
-        .byte >op_b0, >op_b1, >op_b2, >op_b3, >op_b4, >op_b5, >op_b6, >op_b7
-        .byte >op_b8, >op_b9, >op_ba, >op_bb, >op_bc, >op_bd, >op_be, >op_bf
-        .byte >op_c0, >op_c1, >op_c2, >op_c3, >op_c4, >op_c5, >op_c6, >op_c7
-        .byte >op_c8, >op_c9, >op_ca, >op_cb, >op_cc, >op_cd, >op_ce, >op_cf
-        .byte >op_d0, >op_d1, >op_d2, >op_d3, >op_d4, >op_d5, >op_d6, >op_d7
-        .byte >op_d8, >op_d9, >op_da, >op_db, >op_dc, >op_dd, >op_de, >op_df
-        .byte >op_e0, >op_e1, >op_e2, >op_e3, >op_e4, >op_e5, >op_e6, >op_e7
-        .byte >op_e8, >op_e9, >op_ea, >op_eb, >op_ec, >op_ed, >op_ee, >op_ef
-        .byte >op_f0, >op_f1, >op_f2, >op_f3, >op_f4, >op_f5, >op_f6, >op_f7
-        .byte >op_f8, >op_f9, >op_fa, >op_fb, >op_fc, >op_fd, >op_fe, >op_ff
+op_table_lo:
+        .word op_00, op_01, op_02, op_03, op_04, op_05, op_06, op_07
+        .word op_08, op_09, op_0a, op_0b, op_0c, op_0d, op_0e, op_0f
+        .word op_10, op_11, op_12, op_13, op_14, op_15, op_16, op_17
+        .word op_18, op_19, op_1a, op_1b, op_1c, op_1d, op_1e, op_1f
+        .word op_20, op_21, op_22, op_23, op_24, op_25, op_26, op_27
+        .word op_28, op_29, op_2a, op_2b, op_2c, op_2d, op_2e, op_2f
+        .word op_30, op_31, op_32, op_33, op_34, op_35, op_36, op_37
+        .word op_38, op_39, op_3a, op_3b, op_3c, op_3d, op_3e, op_3f
+        .word op_40, op_41, op_42, op_43, op_44, op_45, op_46, op_47
+        .word op_48, op_49, op_4a, op_4b, op_4c, op_4d, op_4e, op_4f
+        .word op_50, op_51, op_52, op_53, op_54, op_55, op_56, op_57
+        .word op_58, op_59, op_5a, op_5b, op_5c, op_5d, op_5e, op_5f
+        .word op_60, op_61, op_62, op_63, op_64, op_65, op_66, op_67
+        .word op_68, op_69, op_6a, op_6b, op_6c, op_6d, op_6e, op_6f
+        .word op_70, op_71, op_72, op_73, op_74, op_75, op_76, op_77
+        .word op_78, op_79, op_7a, op_7b, op_7c, op_7d, op_7e, op_7f
+
+op_table_hi:
+        .word op_80, op_81, op_82, op_83, op_84, op_85, op_86, op_87
+        .word op_88, op_89, op_8a, op_8b, op_8c, op_8d, op_8e, op_8f
+        .word op_90, op_91, op_92, op_93, op_94, op_95, op_96, op_97
+        .word op_98, op_99, op_9a, op_9b, op_9c, op_9d, op_9e, op_9f
+        .word op_a0, op_a1, op_a2, op_a3, op_a4, op_a5, op_a6, op_a7
+        .word op_a8, op_a9, op_aa, op_ab, op_ac, op_ad, op_ae, op_af
+        .word op_b0, op_b1, op_b2, op_b3, op_b4, op_b5, op_b6, op_b7
+        .word op_b8, op_b9, op_ba, op_bb, op_bc, op_bd, op_be, op_bf
+        .word op_c0, op_c1, op_c2, op_c3, op_c4, op_c5, op_c6, op_c7
+        .word op_c8, op_c9, op_ca, op_cb, op_cc, op_cd, op_ce, op_cf
+        .word op_d0, op_d1, op_d2, op_d3, op_d4, op_d5, op_d6, op_d7
+        .word op_d8, op_d9, op_da, op_db, op_dc, op_dd, op_de, op_df
+        .word op_e0, op_e1, op_e2, op_e3, op_e4, op_e5, op_e6, op_e7
+        .word op_e8, op_e9, op_ea, op_eb, op_ec, op_ed, op_ee, op_ef
+        .word op_f0, op_f1, op_f2, op_f3, op_f4, op_f5, op_f6, op_f7
+        .word op_f8, op_f9, op_fa, op_fb, op_fc, op_fd, op_fe, op_ff
