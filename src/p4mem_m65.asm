@@ -241,6 +241,45 @@ clear_low_ram_buffer:
 ; Input: p4_addr_hi:p4_addr_lo = Plus/4 address to read
 ; Output: A = byte read
 ; ============================================================
+; ============================================================
+; P4MEM_ReadFast - Fast path for memory reads
+; Only handles simple RAM cases ($0000-$7FFF), falls through
+; to full P4MEM_Read for anything complex ($8000+)
+; ============================================================
+P4MEM_ReadFast:
+        lda p4_addr_hi
+        bmi P4MEM_Read          ; $80+ needs full handler (ROM/IO)
+        
+        ; $0000-$7FFF: Simple RAM access
+        cmp #$10
+        bcs _readfast_bank5
+        
+        ; $0000-$0FFF: LOW_RAM_BUFFER
+        clc
+        adc #>LOW_RAM_BUFFER
+        sta _readfast_low+2
+        ldx p4_addr_lo
+_readfast_low:
+        lda LOW_RAM_BUFFER,x    ; High byte modified
+        rts
+        
+_readfast_bank5:
+        ; $1000-$7FFF: Direct read from bank 5
+        lda p4_addr_lo
+        sta P4_MEM_PTR
+        lda p4_addr_hi
+        sta P4_MEM_PTR+1
+        lda #BANK_RAM
+        sta P4_MEM_PTR+2
+        lda #$00
+        sta P4_MEM_PTR+3
+        ldz #0
+        lda [P4_MEM_PTR],z
+        rts
+
+; ============================================================
+; P4MEM_Read - Full memory read handler (all address ranges)
+; ============================================================
 P4MEM_Read:
         lda p4_addr_hi
 

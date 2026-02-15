@@ -226,7 +226,7 @@ _f8_slow:
         sta p4_addr_lo
         lda p4_pc_hi
         sta p4_addr_hi
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         inw p4_pc_lo
         rts
 
@@ -412,10 +412,10 @@ addr_ind_jmp:
         sta p4_vec_hi
 ;
 
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_tmp
         inc p4_addr_lo
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_tmp2
 
         lda p4_tmp
@@ -607,11 +607,11 @@ cpu_take_irq:
         sta p4_addr_lo
         lda #$FF
         sta p4_addr_hi
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_pc_lo
         lda #$FF
         sta p4_addr_lo
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_pc_hi
         rts
 
@@ -643,11 +643,11 @@ cpu_take_nmi:
         sta p4_addr_lo
         lda #$FF
         sta p4_addr_hi
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_pc_lo
         lda #$FB
         sta p4_addr_lo
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_pc_hi
         rts
 
@@ -688,11 +688,11 @@ P4CPU_Reset:
         sta p4_addr_lo
         lda #$ff
         sta p4_addr_hi
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_pc_lo
         lda #$fd
         sta p4_addr_lo
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_pc_hi
         rts
 
@@ -1290,11 +1290,11 @@ op_00:
         sta p4_addr_lo
         lda #$ff
         sta p4_addr_hi
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_pc_lo
         lda #$ff
         sta p4_addr_lo
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_pc_hi
         lda #7
         jmp finish_cycles
@@ -1302,7 +1302,7 @@ op_00:
 ; $01 ORA (zp,X)
 op_01:
         jsr addr_indx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         ora p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1385,7 +1385,7 @@ _op0a_nc:
 ; $0D ORA abs
 op_0d:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         ora p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1396,7 +1396,7 @@ op_0d:
 ; $0E ASL abs
 op_0e:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         asl
         php
         sta p4_data
@@ -1439,7 +1439,7 @@ _op10_nt:
 ; $11 ORA (zp),Y
 op_11:
         jsr addr_indy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         ora p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1495,7 +1495,7 @@ op_18:
 ; $19 ORA abs,Y
 op_19:
         jsr addr_absy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         ora p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1506,7 +1506,7 @@ op_19:
 ; $1D ORA abs,X
 op_1d:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         ora p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1517,7 +1517,7 @@ op_1d:
 ; $1E ASL abs,X
 op_1e:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         asl
         php
         sta p4_data
@@ -1565,7 +1565,7 @@ op_20:
 ; $21 AND (zp,X)
 op_21:
         jsr addr_indx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         and p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1693,7 +1693,7 @@ _op2a_nc:
 ; $2C BIT abs
 op_2c:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_tmp
         lda p4_p
         and #(~(P_N|P_V|P_Z)) & $ff
@@ -1719,7 +1719,7 @@ _op2c_nz:
 ; $2D AND abs
 op_2d:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         and p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1730,7 +1730,7 @@ op_2d:
 ; $2E ROL abs
 op_2e:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_tmp
         lda p4_p
         and #P_C
@@ -1779,7 +1779,7 @@ _op30_nt:
 ; $31 AND (zp),Y
 op_31:
         jsr addr_indy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         and p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1847,7 +1847,7 @@ op_38:
 ; $39 AND abs,Y
 op_39:
         jsr addr_absy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         and p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1858,7 +1858,7 @@ op_39:
 ; $3D AND abs,X
 op_3d:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         and p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1869,7 +1869,7 @@ op_3d:
 ; $3E ROL abs,X
 op_3e:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_tmp
         lda p4_p
         and #P_C
@@ -1911,7 +1911,7 @@ op_40:
 ; $41 EOR (zp,X)
 op_41:
         jsr addr_indx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         eor p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2006,7 +2006,7 @@ op_4c:
 ; $4D EOR abs
 op_4d:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         eor p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2017,7 +2017,7 @@ op_4d:
 ; $4E LSR abs
 op_4e:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_tmp
         lsr
         sta p4_data
@@ -2061,7 +2061,7 @@ _op50_nt:
 ; $51 EOR (zp),Y
 op_51:
         jsr addr_indy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         eor p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2119,7 +2119,7 @@ op_58:
 ; $59 EOR abs,Y
 op_59:
         jsr addr_absy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         eor p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2130,7 +2130,7 @@ op_59:
 ; $5D EOR abs,X
 op_5d:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         eor p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2141,7 +2141,7 @@ op_5d:
 ; $5E LSR abs,X
 op_5e:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_tmp
         lsr
         sta p4_data
@@ -2175,7 +2175,7 @@ op_60:
 ; $61 ADC (zp,X)
 op_61:
         jsr addr_indx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_adc
         lda #6
         jmp finish_cycles
@@ -2292,7 +2292,7 @@ op_6c:
 ; $6D ADC abs
 op_6d:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_adc
         lda #4
         jmp finish_cycles
@@ -2300,7 +2300,7 @@ op_6d:
 ; $6E ROR abs
 op_6e:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_tmp
         lda p4_p
         and #P_C
@@ -2356,7 +2356,7 @@ _op70_nt:
 ; $71 ADC (zp),Y
 op_71:
         jsr addr_indy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_adc
         lda #5
         jmp finish_cycles
@@ -2426,7 +2426,7 @@ op_78:
 ; $79 ADC abs,Y
 op_79:
         jsr addr_absy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_adc
         lda #4
         jmp finish_cycles
@@ -2434,7 +2434,7 @@ op_79:
 ; $7D ADC abs,X
 op_7d:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_adc
         lda #4
         jmp finish_cycles
@@ -2442,7 +2442,7 @@ op_7d:
 ; $7E ROR abs,X
 op_7e:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_tmp
         lda p4_p
         and #P_C
@@ -2693,7 +2693,7 @@ op_a0:
 ; $A1 LDA (zp,X)
 op_a1:
         jsr addr_indx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_a
         ;jsr set_zn_a
         #set_zna
@@ -2775,7 +2775,7 @@ op_aa:
 ; $AC LDY abs
 op_ac:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_y
         ;jsr set_zn_a
         #set_zna
@@ -2785,7 +2785,7 @@ op_ac:
 ; $AD LDA abs
 op_ad:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_a
         ;jsr set_zn_a
         #set_zna
@@ -2795,7 +2795,7 @@ op_ad:
 ; $AE LDX abs
 op_ae:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_x
         ;jsr set_zn_a
         #set_zna
@@ -2825,7 +2825,7 @@ _opb0_nt:
 ; $B1 LDA (zp),Y
 op_b1:
         jsr addr_indy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_a
         ;jsr set_zn_a
         #set_zna
@@ -2885,7 +2885,7 @@ op_b8:
 ; $B9 LDA abs,Y
 op_b9:
         jsr addr_absy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_a
         ;jsr set_zn_a
         #set_zna
@@ -2904,7 +2904,7 @@ op_ba:
 ; $BC LDY abs,X
 op_bc:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_y
         ;jsr set_zn_a
         #set_zna
@@ -2914,7 +2914,7 @@ op_bc:
 ; $BD LDA abs,X
 op_bd:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_a
         ;jsr set_zn_a
         #set_zna
@@ -2924,7 +2924,7 @@ op_bd:
 ; $BE LDX abs,Y
 op_be:
         jsr addr_absy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sta p4_x
         ;jsr set_zn_a
         #set_zna
@@ -2941,7 +2941,7 @@ op_c0:
 ; $C1 CMP (zp,X)
 op_c1:
         jsr addr_indx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_cmp
         lda #6
         jmp finish_cycles
@@ -3006,7 +3006,7 @@ op_ca:
 ; $CC CPY abs
 op_cc:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_cpy
         lda #4
         jmp finish_cycles
@@ -3014,7 +3014,7 @@ op_cc:
 ; $CD CMP abs
 op_cd:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_cmp
         lda #4
         jmp finish_cycles
@@ -3022,7 +3022,7 @@ op_cd:
 ; $CE DEC abs
 op_ce:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sec
         sbc #1
         sta p4_data
@@ -3056,7 +3056,7 @@ _opd0_nt:
 ; $D1 CMP (zp),Y
 op_d1:
         jsr addr_indy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_cmp
         lda #5
         jmp finish_cycles
@@ -3098,7 +3098,7 @@ op_d8:
 ; $D9 CMP abs,Y
 op_d9:
         jsr addr_absy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_cmp
         lda #4
         jmp finish_cycles
@@ -3106,7 +3106,7 @@ op_d9:
 ; $DD CMP abs,X
 op_dd:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_cmp
         lda #4
         jmp finish_cycles
@@ -3114,7 +3114,7 @@ op_dd:
 ; $DE DEC abs,X
 op_de:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         sec
         sbc #1
         sta p4_data
@@ -3135,7 +3135,7 @@ op_e0:
 ; $E1 SBC (zp,X)
 op_e1:
         jsr addr_indx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_sbc
         lda #6
         jmp finish_cycles
@@ -3196,7 +3196,7 @@ op_ea:
 ; $EC CPX abs
 op_ec:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_cpx
         lda #4
         jmp finish_cycles
@@ -3204,7 +3204,7 @@ op_ec:
 ; $ED SBC abs
 op_ed:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_sbc
         lda #4
         jmp finish_cycles
@@ -3212,7 +3212,7 @@ op_ed:
 ; $EE INC abs
 op_ee:
         jsr addr_abs
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         clc
         adc #1
         sta p4_data
@@ -3246,7 +3246,7 @@ _opf0_nt:
 ; $F1 SBC (zp),Y
 op_f1:
         jsr addr_indy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_sbc
         lda #5
         jmp finish_cycles
@@ -3288,7 +3288,7 @@ op_f8:
 ; $F9 SBC abs,Y
 op_f9:
         jsr addr_absy
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_sbc
         lda #4
         jmp finish_cycles
@@ -3296,7 +3296,7 @@ op_f9:
 ; $FD SBC abs,X
 op_fd:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         jsr do_sbc
         lda #4
         jmp finish_cycles
@@ -3304,7 +3304,7 @@ op_fd:
 ; $FE INC abs,X
 op_fe:
         jsr addr_absx
-        jsr P4MEM_Read
+        jsr P4MEM_ReadFast
         clc
         adc #1
         sta p4_data

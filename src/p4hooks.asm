@@ -3018,13 +3018,11 @@ _sync_b5_calc_len:
         
         ; DMA copy from bank 5 to LOW_RAM_BUFFER
         lda #$00
-        sta $D702                       ; DMA list bank
-        sta $D704                       ; DMA list address bits 23-16
-        
-        lda #<_sync_b5_dma_list
-        sta $D705
+        sta $D702                       ; DMA list bank 0
         lda #>_sync_b5_dma_list
-        sta $D700                       ; Trigger DMA with high byte
+        sta $D701                       ; High byte
+        lda #<_sync_b5_dma_list
+        sta $D700                       ; Low byte triggers DMA
         
 _sync_b5_done:
         rts
@@ -3037,8 +3035,6 @@ _sync_b5_len_lo:   .byte 0
 _sync_b5_len_hi:   .byte 0
 
 _sync_b5_dma_list:
-        .byte $0A                       ; Request format (F018A with options)
-        .byte $00                       ; End of options
         .byte $00                       ; Command: COPY
 _sync_b5_dma_count:
         .word $0000                     ; Count (filled in)
@@ -3048,4 +3044,5 @@ _sync_b5_dma_src:
 _sync_b5_dma_dst:
         .word $0000                     ; Dest address (filled in = LOW_RAM_BUFFER + offset)
         .byte $00                       ; Dest bank 0
-        .word $0000                     ; Modulo (unused)
+        .byte $00                       ; Sub-command
+        .word $0000                     ; Modulo
