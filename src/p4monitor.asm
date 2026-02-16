@@ -23,7 +23,7 @@
         p4_pc_hi = $08
         
         ; From p4mem_m65.asm
-        ted_regs = $0400
+        ; ted_regs is defined in plus4_cpu_m65.asm - don't override!
         p4_rom_visible = $0500
         LOW_RAM_BUFFER = $A000
         BANK_RAM = $05
@@ -226,15 +226,34 @@ P4MON_Activate:
         sta $D705               ; Trigger DMA
         
         ; Now switch to standard text mode for monitor
-        ; NOTE: Don't touch $D031 - it causes TED register corruption
+        ; 
+        ; Strategy: Re-enable HOTREG temporarily so that writing $D011
+        ; triggers a full recalculation of ALL VIC-IV display parameters
+        ; (CHRYSCL, borders, scaling, char height, etc.) for standard
+        ; C64 text mode. Then disable HOTREG and set our VIC-IV pointers.
+        ; This avoids having to manually set every vernier register.
         
         lda $D054
         and #%11111100          ; Clear CHR16 and FCM bits
         sta $D054
         
-        ; Set standard text mode in $D011
+        ; Enable HOTREG so D011 write recalculates everything
+        lda #$80
+        tsb $D05D               ; Set bit 7 = enable hot registers
+        
+        ; Write D011 - triggers full C64-mode display recalculation
+        ; This sets CHRYSCL, borders, scaling, etc. correctly
         lda #$1B                ; Screen on, 25 rows, no bitmap
         sta $D011
+        
+        ; Also write D018 to set correct C64 screen/charset mapping
+        ; Screen at $0400, charset at ROM default
+        lda #$14                ; Screen $0400, charset $1000 (C64 default)
+        sta $D018
+        
+        ; Now disable HOTREG before we set VIC-IV pointers
+        lda #$80
+        trb $D05D               ; Clear HOTREG - pointers will stick
         
         ; Set monitor colors
         lda #MON_BORDER_COLOR
@@ -249,8 +268,7 @@ P4MON_Activate:
         sta $D061               ; SCRNPTR mid = $04 for $0400
         lda #$00
         sta $D062               ; SCRNPTR bank = 0
-        lda #40
-        sta $D063               ; LINESTEP = 40
+        sta $D063               ; SCRNPTR megabyte = 0 (NOT linestep!)
         
         ; Point to standard C64 charset at $2D000 (MEGA65 ROM charset)
         lda #$00
@@ -262,9 +280,9 @@ P4MON_Activate:
         
         ; Make sure we're in 40-column mode
         lda #40
-        sta $D058               ; Logical chars per row (low)
+        sta $D058               ; LINESTEP low (bytes per row)
         lda #0
-        sta $D059               ; Logical chars per row (high)
+        sta $D059               ; LINESTEP high
         
         ; Initialize view address to current PC
         lda p4_pc_lo
@@ -471,7 +489,7 @@ sync_d800_p3:
         iny
         bne sync_d800_p3
         
-        ; Restore mode registers FIRST (before pointers)
+        ; Restore mode registers (hot registers) FIRST
         lda mon_saved_d054
         sta $D054
         lda mon_saved_d016
@@ -479,13 +497,27 @@ sync_d800_p3:
         lda mon_saved_d018
         sta $D018
         
+        ; Restore extended mode register (also hot)
+        lda mon_saved_d031
+        sta $D031
+        
+        ; Restore D011 (also hot)
+        lda mon_saved_d011
+        sta $D011
+        
+        ; CRITICAL: All hot register writes above set pending recalc flags.
+        ; Clear HOTREG now to cancel pending recalculation before we set
+        ; the VIC-IV pointers, otherwise they'll get stomped.
+        lda #$80
+        trb $D05D               ; Clear HOTREG + cancel pending recalc
+        
         ; Restore screen dimensions
         lda mon_saved_d058
         sta $D058
         lda mon_saved_d059
         sta $D059
         
-        ; Restore VIC-IV pointers
+        ; NOW restore VIC-IV pointers (safe - no pending recalc)
         lda mon_saved_scrnptr_lo
         sta $D060
         lda mon_saved_scrnptr_mid
@@ -501,15 +533,8 @@ sync_d800_p3:
         lda mon_saved_charptr_hi
         sta $D06A
         
-        ; Restore extended mode register
-        lda mon_saved_d031
-        sta $D031
-        
-        ; Restore D011 (this enables screen, so do it near end)
-        lda mon_saved_d011
-        sta $D011
-        
-        ; Restore hot register setting
+        ; Restore hot register setting last
+        ; (emulator keeps HOTREG disabled, but be safe)
         lda mon_saved_d05d
         sta $D05D
         
@@ -1327,34 +1352,37 @@ ga_cancel:
         rts
 
 ga_char_to_hex:
-        cmp #'0'
+        ; Digits 0-9 ($30-$39) — same in all encodings
+        cmp #$30
         bcc ga_not_hex
-        cmp #'9'+1
+        cmp #$3A
         bcc ga_is_digit
-        cmp #'A'
-        bcc ga_not_hex
-        cmp #'F'+1
-        bcc ga_is_upper
-        cmp #'a'
-        bcc ga_not_hex
-        cmp #'f'+1
-        bcc ga_is_lower
+        ; Try all known encodings for A-F:
+        ; Uppercase PETSCII: $41-$46
+        ; Lowercase PETSCII: $C1-$C6
+        ; Screen codes lowercase: $01-$06
+        ; ASCII lowercase: $61-$66
+        ; Normalize: mask with $1F to get letter position (A=1..F=6)
+        pha
+        and #$1F
+        cmp #$01
+        bcc _ga_not_af
+        cmp #$07
+        bcs _ga_not_af
+        ; It's A-F: value 1-6, convert to nibble 10-15
+        clc
+        adc #9                  ; 1+9=10(A), 2+9=11(B), ... 6+9=15(F)
+        plx                     ; discard saved A (pull into X to balance stack)
+        clc
+        rts
+_ga_not_af:
+        pla                     ; restore original value
 ga_not_hex:
         sec
         rts
 ga_is_digit:
         sec
-        sbc #'0'
-        clc
-        rts
-ga_is_upper:
-        sec
-        sbc #'A'-10
-        clc
-        rts
-ga_is_lower:
-        sec
-        sbc #'a'-10
+        sbc #$30
         clc
         rts
 
