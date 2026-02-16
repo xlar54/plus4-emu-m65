@@ -56,6 +56,7 @@ p4_cur_div:       .byte 0     ; frame divider
 ; --- Video present state (host-side) ---
 ; 0=text mirror active, 1=bitmap present active
 p4_video_mode:    .byte 0
+p4_bitmap_was_active: .byte 0   ; Set when bitmap mode entered, cleared after frame render
 p4_gfx_dirty:     .byte 0
 p4_bmp_hi:        .byte $20   ; default $2000
 p4_screen_fill_pending: .byte 0  ; 1=need to fill screen RAM in frame handler
@@ -367,180 +368,129 @@ read_ram_direct:
 ; $FF20-$FF3F mirrors $FF00-$FF1F
 ; ============================================================
 read_ted_register:
-
+        ; Use jump table for TED register reads
+        ; Much faster than CMP/BEQ ladder
         lda p4_addr_lo
         and #$1F                        ; Mask to $00-$1F (handle mirroring)
-        
-        cmp #$00
-        beq _read_timer1_lo             ; $FF00 = Timer 1 low (running value)
-        cmp #$01
-        beq _read_timer1_hi             ; $FF01 = Timer 1 high (running value)
-        cmp #$08
-        beq _read_keyboard
-        cmp #$12
-        beq _read_ff12
-        cmp #$13
-        beq _read_ff13
-        cmp #$14
-        beq _read_ff14
-        cmp #$15
-        beq _read_ff15
-        cmp #$16
-        beq _read_ff16              ; RAM size / memory config register
-        cmp #$17
-        beq _read_ff17
-        cmp #$18
-        beq _read_ff18
-        cmp #$19
-        beq _read_ff19
-        cmp #$1C
-        beq _read_raster_hi     ; $FF1C = high bit (bit 8 of raster)
-        cmp #$1D
-        beq _read_raster_lo     ; $FF1D = low byte of raster
-        
+        asl                             ; × 2 for word index
+        tax
+        jmp (ted_read_table,x)
+
+; Variables for TED read handlers
+kb_selector: .byte $FF
+
+; Default handler - just read from ted_regs array
+ted_read_default:
+        lda p4_addr_lo
+        and #$1F
         tax
         lda ted_regs,x
         rts
 
-_read_timer1_lo:
+; Special handlers for registers that need extra processing
+ted_read_00:                            ; Timer 1 low (running value)
         lda ted_timer1_lo
         rts
 
-_read_timer1_hi:
+ted_read_01:                            ; Timer 1 high (running value)
         lda ted_timer1_hi
         rts
-_read_ff12:
+
+ted_read_08:                            ; Keyboard/joystick latch
+        jsr P4_CheckCursorKeys
+        lda $DC00
+        sta kb_selector
+        lda $DC01
+        ldx kb_selector
+        cpx #$FE
+        bne +
+        ora #$84                        ; Mask out C64 cursor keys
++       rts
+
+ted_read_12:
         lda ted_regs+$12
-        ora #$C0                ; Set bits 7 and 6
+        ora #$C0                        ; Bits 7,6 always read as 1
         rts
-_read_ff13:
+
+ted_read_13:
         lda ted_regs+$13
-        ora #$C1
+        ora #$C1                        ; Bits 7,6,0 always read as 1
         rts
-_read_ff14:
+
+ted_read_14:
         lda ted_regs+$14
-        ora #$07                ; Set bits 0-2 (not connected)
+        ora #$07                        ; Bits 2-0 always read as 1
         rts
-_read_ff15:
+
+ted_read_15:
         lda ted_regs+$15
-        ora #$80
+        ora #$80                        ; Bit 7 always reads as 1
         rts
-_read_ff16:
-        ; $FF16 is the RAM size / memory configuration register
-        ; On Plus/4 (64KB): reading returns $C0 (bits 7,6 set) regardless of what was written
-        ; On C16 (16KB): reading returns $00 or $40
-        ; We emulate a Plus/4 with 64KB, so always return with bits 7,6 set
+
+ted_read_16:
         lda ted_regs+$16
-        ora #$C0                        ; Set bits 7 and 6 for 64KB Plus/4
+        ora #$C0                        ; 64KB Plus/4: bits 7,6 always set
         rts
-_read_ff17:
+
+ted_read_17:
         lda ted_regs+$17
         ora #$80
         rts
 
-_read_ff18:
+ted_read_18:
         lda ted_regs+$18
         ora #$80
         rts
-_read_ff19:
+
+ted_read_19:
         lda ted_regs+$19
         ora #$80
         rts
 
-_read_keyboard:
-        ; Check and inject cursor keys on every keyboard poll
-        jsr P4_CheckCursorKeys
-        
-        ; Read CIA column selector
-        lda $DC00
-        sta _kb_selector
-        
-        ; Read CIA result
-        lda $DC01
-        
-        ; Mask out C64 cursor keys to prevent ghost characters
-        ; C64 cursor DOWN/UP is column 0 ($FE), row 7 (bit 7)
-        ; C64 cursor RIGHT/LEFT is column 0 ($FE), row 2 (bit 2)
-        ldx _kb_selector
-        cpx #$FE                ; Column 0?
-        bne _kb_done
-        ora #$84                ; Force bits 7 and 2 HIGH (mask out cursors)
-_kb_done:
+ted_read_1c:                            ; Raster high bit
+        lda ted_regs+$1D
+        and #$FE
+        ora ted_raster_hi
         rts
 
-_kb_selector: .byte $FF
-
-        ; Get the selector that Plus/4 wrote
-        lda $DC00
-        sta _kb_selector
-        
-        ; Get the base result from CIA
-        lda $DC01
-        sta _kb_result
-
-        ; Check if Plus/4 is scanning column $DF (UP/DOWN cursor)
-        lda _kb_selector
-        and #$20
-        bne _kb_check_bf
-        
-        ; Scanning $DF - inject cached cursor UP/DOWN state
-        lda cursor_down_pressed
-        beq _kb_check_up
-        lda _kb_result
-        and #$FE                ; DOWN = clear bit 0
-        sta _kb_result
-        
-_kb_check_up:
-        lda cursor_up_pressed
-        beq _kb_check_bf
-        lda _kb_result
-        and #$F7                ; UP = clear bit 3
-        sta _kb_result
-
-_kb_check_bf:
-        ; Check if Plus/4 is scanning column $BF (LEFT/RIGHT cursor)
-        lda _kb_selector
-        and #$40
-        bne _kb_check_at
-        
-        ; Scanning $BF - inject cached cursor LEFT/RIGHT state
-        lda cursor_right_pressed
-        beq _kb_check_left
-        lda _kb_result
-        and #$F7                ; RIGHT = clear bit 3
-        sta _kb_result
-
-_kb_check_left:
-        lda cursor_left_pressed
-        beq _kb_check_at
-        lda _kb_result
-        and #$FE                ; LEFT = clear bit 0
-        sta _kb_result
-
-_kb_check_at:
-        ; HACK: Suppress @ ghost when cursor down is pressed
-        ; @ is at column $7F (bit 7 clear), row bit 0
-        ; When cursor down sets row bit 0 low, it can ghost to @
-        lda cursor_down_pressed
-        beq _kb_done
-        
-        ; Check if scanning column $7F (bit 7 clear)
-        lda _kb_selector
-        and #$80
-        bne _kb_done            ; Bit 7 set = not column $7F
-        
-        ; We ARE scanning column $7F and cursor down is pressed
-        ; Force bit 0 HIGH to suppress @ ghost
-        lda _kb_result
-        ora #$01
-        sta _kb_result
-
-_kb_donew:
-        lda _kb_result
+ted_read_1d:                            ; Raster low byte
+        lda ted_raster_lo
         rts
 
-_kb_result:      .byte $FF
-_kb_selectorw:    .byte $FF
+; Jump table for TED register reads (32 entries)
+ted_read_table:
+        .word ted_read_00               ; $00 - Timer 1 low
+        .word ted_read_01               ; $01 - Timer 1 high
+        .word ted_read_default          ; $02
+        .word ted_read_default          ; $03
+        .word ted_read_default          ; $04
+        .word ted_read_default          ; $05
+        .word ted_read_default          ; $06
+        .word ted_read_default          ; $07
+        .word ted_read_08               ; $08 - Keyboard
+        .word ted_read_default          ; $09
+        .word ted_read_default          ; $0A
+        .word ted_read_default          ; $0B
+        .word ted_read_default          ; $0C
+        .word ted_read_default          ; $0D
+        .word ted_read_default          ; $0E
+        .word ted_read_default          ; $0F
+        .word ted_read_default          ; $10
+        .word ted_read_default          ; $11
+        .word ted_read_12               ; $12
+        .word ted_read_13               ; $13
+        .word ted_read_14               ; $14
+        .word ted_read_15               ; $15
+        .word ted_read_16               ; $16
+        .word ted_read_17               ; $17
+        .word ted_read_18               ; $18
+        .word ted_read_19               ; $19
+        .word ted_read_default          ; $1A
+        .word ted_read_default          ; $1B
+        .word ted_read_1c               ; $1C - Raster high
+        .word ted_read_1d               ; $1D - Raster low
+        .word ted_read_default          ; $1E
+        .word ted_read_default          ; $1F
 
 ; Cursor key state - updated once per frame by P4_CheckCursorKeys
 cursor_up_pressed:    .byte 0
@@ -730,152 +680,127 @@ _write_not_ff3e:
         cmp #$40
         bcs p4mem_write_to_ram          ; $FF40+ -> RAM under ROM
         
-        ; $FF00-$FF3F: ALL are TED registers (with $FF20-$FF3F mirroring $FF00-$FF1F)
+        ; $FF00-$FF3F: TED registers (with $FF20-$FF3F mirroring $FF00-$FF1F)
+        ; First store to ted_regs, then call handler for side effects
         and #$1F                        ; Mask to $00-$1F (handle mirroring)
         tax
         lda p4_saved_data
         sta ted_regs,x
-
-        ; Check for sound register writes
-        ; Plus/4 BASIC SOUND command has unusual register mapping:
-        ; SOUND 1: freq_lo -> $FF0E, freq_hi -> $FF12 (!)
-        ; SOUND 2/3: freq_lo -> $FF0F, freq_hi -> $FF10, control -> $FF11
-        ;
-        ; For SOUND 2/3, we ONLY trigger when $FF11 is written (last in sequence)
-        ; This ensures all frequency values are in place before playing
-        cpx #$08
-        beq _ted_kbd_latch              ; $FF08 - keyboard/joystick latch
-        cpx #$0E
-        beq _ted_sound_v1_changed       ; Voice 1 freq low - triggers update
-        cpx #$0F
-        beq _ted_check_video            ; Voice 2 freq low - just store
-        cpx #$10
-        beq _ted_check_video            ; Voice 2 freq high - just store
-        cpx #$11
-        beq _ted_sound_vol_and_noise    ; Volume + control - triggers voice 2 update
-        cpx #$12
-        beq _ted_reg12_write            ; $FF12 - sound AND video AND charset!
-        cpx #$13
-        beq _ted_reg13_write            ; $FF13 - charset base address
-        ; Cursor position changes
-        cpx #$0C
-        beq _ted_cursor_changed
-        cpx #$0D
-        beq _ted_cursor_changed
-        bra _ted_check_video
-
-_ted_kbd_latch:
-        ; $FF08 write - keyboard selector already captured by CPU op_8d
-        ; Just return, nothing else needed here
-        rts
-
-_ted_cursor_changed:
-        phx
-        jsr P4VID_UpdateCursor
-        plx
-        bra _ted_check_video
-
-_ted_reg12_write:
-        ; $FF12 handles: sound voice 1 high bits, video mode, AND charset
-        ; 
-        ; Only update sound if voice 1 is currently active.
-        ; This prevents GRAPHIC mode changes from triggering sound blips
-        ; when $FF12 is written for video purposes only.
-        lda p4snd_voice1_on
-        beq _ted_reg12_skip_sound
-        lda ted_regs+$12
-        and #$03
-        sta p4snd_v1_freq_hi
-        jsr P4SND_UpdateVoice1_WithHigh
-_ted_reg12_skip_sound:
-        ; Then check video mode
-        jsr P4VID_GfxConfigChanged
-        ; Then check charset
-        jsr P4VID_CharsetChanged
-        rts
-
-_ted_reg13_write:
-        ; $FF13 is charset base address
-        jsr P4VID_CharsetChanged
-        rts
-
-_ted_check_video:
-        ; Video mode / bitmap base changes
-        cpx #$06
-        beq _ted_vidchg
-        cpx #$07
-        beq _ted_vidchg
-        cpx #$14
-        beq _ted_vidchg         ; Just call GfxConfigChanged, don't update screen pointer yet
-        bra _ted_check_other
         
-_ted_vidchg:
-        jsr P4VID_GfxConfigChanged
+        ; Use jump table for post-write side effects
+        txa
+        asl                             ; × 2 for word index
+        tax
+        jmp (ted_write_table,x)
 
-_ted_check_other:
-        cpx #$01
-        beq _write_ff01
-        cpx #$09
-        beq _write_ff09
-        cpx #$15
-        beq _write_ff15
-        cpx #$19
-        beq _write_ff19
+; Default handler - no side effects needed
+ted_write_default:
         rts
 
-_write_ff01:
+; Special handlers for registers with side effects
+ted_write_01:                           ; Timer reload (when $FF01 written)
         lda ted_regs+$00
         sta ted_timer1_lo
         lda ted_regs+$01
         sta ted_timer1_hi
         rts
 
-_write_ff09:
+ted_write_06:                           ; Video mode
+ted_write_07:                           ; Multicolor / scroll
+ted_write_14:                           ; Screen address
+        jsr P4VID_GfxConfigChanged
+        rts
+
+ted_write_08:                           ; Keyboard latch - already handled by CPU
+        rts
+
+ted_write_09:                           ; IRQ acknowledge (write 1 to clear)
         lda p4_saved_data
         eor #$FF
         and ted_regs+$09
         sta ted_regs+$09
         rts
 
-_write_ff15:
-        ; Background color - store in ted_regs AND apply to VIC-IV
-        ; In text mode, use TED color directly (128-color palette)
-        ; Value is also stored for bitmap mode to map later
-        lda p4_saved_data
-        sta ted_regs+$15        ; Store in TED register shadow
-        and #$7F                ; TED color is 7 bits (0-127)
-        sta $D021               ; VIC-IV uses our custom 128-color palette
+ted_write_0c:                           ; Cursor position high
+ted_write_0d:                           ; Cursor position low
+        jsr P4VID_UpdateCursor
         rts
 
-_write_ff19:
-        ; Border color - store in ted_regs AND apply to VIC-IV
-        ; In text mode, use TED color directly (128-color palette)
-        lda p4_saved_data
-        sta ted_regs+$19        ; Store in TED register shadow
-        and #$7F                ; TED color is 7 bits (0-127)
-        sta $D020               ; VIC-IV uses our custom 128-color palette
-        rts
-
-; Jump targets for sound register changes
-_ted_sound_v1_changed:
+ted_write_0e:                           ; Voice 1 freq low
         jsr P4SND_UpdateVoice1
         rts
 
-_ted_sound_vol_and_noise:
-        ; $FF11 written - update volume
+ted_write_11:                           ; Volume + voice control
         jsr P4SND_UpdateVolume
-        ; Check if this is a SOUND 2/3 command
-        ; SOUND 2 sets bit 5 ($20), SOUND 3 sets bit 6 ($40)
-        ; SOUND 1 only sets bit 4 ($10)
-        ; So if bits 5 or 6 are set, this is SOUND 2/3
         lda ted_regs+$11
-        and #$60                ; Check bits 5 and 6
-        beq _vol_done           ; If neither set, this is SOUND 1, skip voice 2 update
-        ; This is SOUND 2 or 3 - trigger voice 2 update
-        ; Now all registers ($FF0F, $FF10, $FF11) have been written
+        and #$60                        ; Check bits 5 and 6 (voice 2/3)
+        beq +
         jsr P4SND_UpdateVoice2_FromBasic
-_vol_done:
++       rts
+
+ted_write_12:                           ; Sound high bits + video mode + charset
+        lda p4snd_voice1_on
+        beq +
+        lda ted_regs+$12
+        and #$03
+        sta p4snd_v1_freq_hi
+        jsr P4SND_UpdateVoice1_WithHigh
++       jsr P4VID_GfxConfigChanged
+        jsr P4VID_CharsetChanged
         rts
+
+ted_write_13:                           ; Charset base address
+        jsr P4VID_CharsetChanged
+        rts
+
+ted_write_15:                           ; Background color
+        lda p4_saved_data
+        sta ted_regs+$15
+        and #$7F
+        sta $D021
+        rts
+
+ted_write_19:                           ; Border color
+        lda p4_saved_data
+        sta ted_regs+$19
+        and #$7F
+        sta $D020
+        rts
+
+; Jump table for TED register writes (32 entries)
+ted_write_table:
+        .word ted_write_default         ; $00 - Timer low latch
+        .word ted_write_01              ; $01 - Timer high + reload
+        .word ted_write_default         ; $02
+        .word ted_write_default         ; $03
+        .word ted_write_default         ; $04
+        .word ted_write_default         ; $05
+        .word ted_write_06              ; $06 - Video mode
+        .word ted_write_07              ; $07 - Multicolor
+        .word ted_write_08              ; $08 - Keyboard latch
+        .word ted_write_09              ; $09 - IRQ acknowledge
+        .word ted_write_default         ; $0A
+        .word ted_write_default         ; $0B
+        .word ted_write_0c              ; $0C - Cursor high
+        .word ted_write_0d              ; $0D - Cursor low
+        .word ted_write_0e              ; $0E - Voice 1 freq low
+        .word ted_write_default         ; $0F - Voice 2 freq low (just store)
+        .word ted_write_default         ; $10 - Voice 2 freq high (just store)
+        .word ted_write_11              ; $11 - Volume + control
+        .word ted_write_12              ; $12 - Sound/video/charset
+        .word ted_write_13              ; $13 - Charset base
+        .word ted_write_14              ; $14 - Screen address
+        .word ted_write_15              ; $15 - Background color
+        .word ted_write_default         ; $16
+        .word ted_write_default         ; $17
+        .word ted_write_default         ; $18
+        .word ted_write_19              ; $19 - Border color
+        .word ted_write_default         ; $1A
+        .word ted_write_default         ; $1B
+        .word ted_write_default         ; $1C
+        .word ted_write_default         ; $1D
+        .word ted_write_default         ; $1E
+        .word ted_write_default         ; $1F
 
 p4mem_write_check_fd:
         lda p4_addr_hi
@@ -1001,6 +926,7 @@ _gfx_enter_bitmap:
         ; Enter bitmap mode - determine if multicolor
         lda #1
         sta p4_video_mode
+        sta p4_bitmap_was_active        ; Track that bitmap was used this frame
 
         ; Check multicolor bit in $FF07 (bit 4)
         lda ted_regs+$07
@@ -1231,15 +1157,18 @@ _pf_no_charset:
         sta p4_screen_fill_pending
         jsr P4VID_DoScreenFill
 _pf_no_fill:
-        
+        ; Only render bitmap if we're currently in bitmap mode
         lda p4_video_mode
-        beq _pf_done
+        beq _pf_done            ; Not in bitmap mode, skip
+        
+        ; We're in bitmap mode - render if dirty
         lda p4_gfx_dirty
         beq _pf_done
         lda #0
         sta p4_gfx_dirty
-
-       jsr P4VID_RenderHiresBitmap
+        
+        jsr P4VID_RenderHiresBitmap
+        
 _pf_done:
         rts
 
@@ -1441,7 +1370,7 @@ P4VID_RenderHiresBitmap:
         lda p4_host_bmp_on
         beq _rb_done
 
-        ; Base source address = (p4_bmp_hi<<8)
+        ; Base source address = (p4_bmp_hi<<8) in bank 5
         lda #$00
         sta rb_src_row_lo
         lda p4_bmp_hi
@@ -1455,51 +1384,25 @@ P4VID_RenderHiresBitmap:
 
         ldx #25                 ; 25 character rows (200 lines / 8)
 _rb_row_loop:
-        ; src_line = src_row
+        ; Patch DMA list source address
         lda rb_src_row_lo
-        sta rb_src_line_lo
-        lda rb_src_row_hi
-        sta rb_src_line_hi
-
-        ; dst_row is already in rb_dst_row_*
-        ldy #0                  ; line 0..7
-_rb_line_loop:
-        ; Patch DMA list source address (bank BANK_RAM)
-        lda rb_src_line_lo
         sta _rb_dma_src_lo
-        lda rb_src_line_hi
+        lda rb_src_row_hi
         sta _rb_dma_src_hi
 
-        ; Patch DMA list destination address:
-        ; dst = dst_row + (line * 40)
-        clc
+        ; Patch DMA list destination address
         lda rb_dst_row_lo
-        adc rb_line_add_lo,y
         sta _rb_dma_dst_lo
         lda rb_dst_row_hi
-        adc rb_line_add_hi,y
         sta _rb_dma_dst_hi
 
-        ; Trigger DMA copy of 40 bytes
+        ; Trigger DMA copy of 320 bytes (one full character row = 8 lines × 40 bytes)
         lda #$00
         sta $D702               ; DMA list bank 0
         lda #>_rb_dma_list
         sta $D701
         lda #<_rb_dma_list
         sta $D700               ; triggers DMA
-
-        ; Advance src_line by 40 bytes
-        clc
-        lda rb_src_line_lo
-        adc #40
-        sta rb_src_line_lo
-        lda rb_src_line_hi
-        adc #0
-        sta rb_src_line_hi
-
-        iny
-        cpy #8
-        bne _rb_line_loop
 
         ; Advance src_row by 320 bytes ($0140)
         clc
@@ -1525,81 +1428,164 @@ _rb_line_loop:
 _rb_done:
         rts
 
-; DMA list for one 40-byte copy (patched per line)
+; DMA list for 320-byte copy (one full character row)
 _rb_dma_list:
-        .byte $00               ; copy
-        .word 40                ; count
+        .byte $00               ; copy command
+        .word 320               ; count (8 lines × 40 bytes = 320)
 _rb_dma_src_lo:
         .byte $00
 _rb_dma_src_hi:
         .byte $20
-        .byte BANK_RAM          ; src bank
+        .byte BANK_RAM          ; src bank (5)
 _rb_dma_dst_lo:
         .byte $00
 _rb_dma_dst_hi:
         .byte $20
-        .byte HOST_BUF_BANK     ; dst bank
+        .byte HOST_BUF_BANK     ; dst bank (1)
         .byte $00               ; sub-command
         .word $0000             ; modulo
-
-; Helpers for dst = dst_row + line*40
-rb_line_add_lo:
-        .byte $00,$28,$50,$78,$A0,$C8,$F0,$18
-rb_line_add_hi:
-        .byte $00,$00,$00,$00,$00,$00,$00,$01
 
 ; Working vars
 rb_src_row_lo:   .byte 0
 rb_src_row_hi:   .byte 0
 rb_dst_row_lo:   .byte 0
 rb_dst_row_hi:   .byte 0
-rb_src_line_lo:  .byte 0
-rb_src_line_hi:  .byte 0
 
 copy_mc_screen_ram:
-        ; Screen RAM provides the FOREGROUND color for %01/%10 pixels
-        ; Get the foreground color (black) from P4_TCOLOR
-        lda P4_TCOLOR
+        ; In TED multicolor bitmap mode:
+        ; - Attribute RAM at $0800 contains per-cell color data
+        ; - Each byte: bits 6-4 = luminance, bits 3-0 = hue (0-127 range)
+        ;
+        ; For VIC-IV multicolor bitmap with NCM (Nibble Color Mode):
+        ; - Screen RAM holds 8-bit color indices per cell
+        ; - We can use the full TED palette (0-127) directly!
+        ;
+        ; But standard VIC-II multicolor only uses 4-bit colors (0-15).
+        ; So we must map TED colors to 16 entries.
+        ;
+        ; Strategy: Extract hue (lower 4 bits) for screen RAM
+        ;           This maps all luminances of same hue to same color.
+        
+        ; Source: attribute RAM at $0800 = LOW_RAM_BUFFER + $0800 = $A800
+        lda #$08
+        sta _mc_src_hi
+        
+        ; Copy 4 pages (1024 bytes, only 1000 used)
+        lda #0
+        sta _mc_page_cnt
+        
+_mc_page_loop:
+        ; Calculate source high byte
+        lda _mc_page_cnt
+        clc
+        adc _mc_src_hi
+        
+        ; Check if source is in low RAM ($0000-$0FFF)
+        cmp #$10
+        bcs _mc_setup_bank5
+        
+        ; Source in LOW_RAM_BUFFER
+        clc
+        adc #>LOW_RAM_BUFFER
+        sta P4_MEM_PTR+1
+        lda #0
+        sta P4_MEM_PTR
+        bra _mc_setup_dest
+        
+_mc_setup_bank5:
+        ; Source in bank 5 - for simplicity, assume it's in LOW_RAM_BUFFER range
+        ; Most Plus/4 programs use default $0800 which is in LOW_RAM_BUFFER
+        clc
+        adc #>LOW_RAM_BUFFER
+        sta P4_MEM_PTR+1
+        lda #0
+        sta P4_MEM_PTR
+        
+_mc_setup_dest:
+        ; Set up destination in bank 1 (HOST_BUF_BANK)
+        ; We'll use 32-bit addressing with Z=0 and increment manually
+        lda _mc_page_cnt
+        clc
+        adc #>HOST_BMP_SCR      ; Add page offset to $04
+        sta P4_MEM_PTR+3
+        lda #<HOST_BMP_SCR
+        sta P4_MEM_PTR+2
+        
+        ; Copy this page (256 bytes)
+        ldy #0
+_mc_byte_loop:
+        ; Read byte from Plus/4 video matrix (in LOW_RAM_BUFFER, bank 0)
+        lda (P4_MEM_PTR),y
+        
+        ; Convert TED color to C64 color
+        ; TED format: bits 6-4 = luminance, bits 3-0 = hue
         and #$7F
         tax
         lda ted_to_c64_color,x
         and #$0F
-        sta _mc_scr_tmp
-        asl
-        asl
-        asl
-        asl
-        ora _mc_scr_tmp             ; Same color in both nybbles
-        sta _mc_scr_fill
-        sta _mc_scr_fill+1
+        sta _mc_tmp
         
-        ; Use standard DMA trigger (not inline)
-        lda #$00
-        sta $D702               ; DMA list in bank 0
-        lda #>_mc_scr_dmalist
-        sta $D701               ; DMA list MSB
-        lda #<_mc_scr_dmalist
-        sta $D700               ; DMA list LSB - triggers DMA
+        ; Put same color in both nibbles
+        asl
+        asl
+        asl
+        asl
+        ora _mc_tmp
+        
+        ; Write to screen RAM in bank 1
+        ; Store dest address in separate ZP location for 32-bit write
+        phy
+        sty _mc_tmp2            ; Save Y offset
+        
+        ; Calculate full dest address: HOST_BMP_SCR + page*256 + Y
+        clc
+        lda P4_MEM_PTR+2        ; Low byte of dest
+        adc _mc_tmp2            ; Add Y offset
+        sta $FA
+        lda P4_MEM_PTR+3        ; High byte of dest
+        adc #0
+        sta $FB
+        lda #HOST_BUF_BANK      ; Bank 1
+        sta $FC
+        lda #0
+        sta $FD
+        
+        ; Get the converted color back
+        lda _mc_tmp
+        asl
+        asl
+        asl
+        asl
+        ora _mc_tmp
+        
+        ; Write using 32-bit addressing
+        ldz #0
+        sta [$FA],z
+        
+        ply
+        
+        ; Next byte
+        iny
+        bne _mc_byte_loop
+        
+        ; Next page
+        inc _mc_page_cnt
+        lda _mc_page_cnt
+        cmp #4                  ; 4 pages = 1024 bytes (1000 used)
+        bcc _mc_page_loop
+        
         rts
 
-_mc_scr_dmalist:
-        .byte $03                       ; fill command
-        .word $03E8                     ; count (1000 bytes)
-_mc_scr_fill:
-        .word $0000                     ; fill value (patched above)
-        .byte $00                       ; source bank (unused for fill)
-        .word HOST_BMP_SCR                     ; Screen RAM at $CC00 in bank 3
-        .byte HOST_BUF_BANK                       ; dest bank 0
-        .byte $00                       ; sub-command (F018B)
-        .word $0000                     ; modulo
-
-_mc_scr_tmp: .byte 0
+_mc_src_hi:     .byte 0
+_mc_page_cnt:   .byte 0
+_mc_tmp:        .byte 0
+_mc_tmp2:       .byte 0
 
 
 copy_mc_color_ram:
-        ; Color RAM provides the BACKGROUND color for %11 pixels
-        ; Get background from TED $FF15
-        lda ted_regs+$15
+        ; Color RAM provides color for %11 pixels
+        ; On TED this comes from $FF17 (color 3 / background 2)
+        lda ted_regs+$17
         and #$7F
         tax
         lda ted_to_c64_color,x
@@ -1658,7 +1644,7 @@ _pal_loop:
 
 ; ============================================================
 ; P4VID_SetBrightTEDPalette16
-; Overwrite VIC palette entries 0..15 with the *brightest* TED hues.
+; Set VIC palette entries 0..15 with brightest TED hues.
 ;
 ; Why this exists:
 ;   - In VIC-II bitmap modes, color indices are only 0..15.
@@ -1670,7 +1656,7 @@ _pal_loop:
 P4VID_SetBrightTEDPalette16:
         ldx #0
 _btp_loop:
-        lda ted_palette_r+$70,x
+        lda ted_palette_r+$70,x   ; Luminance 7 (brightest)
         sta $D100,x
         lda ted_palette_g+$70,x
         sta $D200,x
