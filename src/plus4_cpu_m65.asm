@@ -62,6 +62,22 @@ set_zna .macro
         txa
 .endmacro
 
+; ------------------------------------------------------------
+; finish_cycles_inline - Inlined cycle accounting macro
+; A = base cycle count on entry
+; Most instructions won't cross a scanline, so we inline the fast path
+; ------------------------------------------------------------
+finish_cycles_inline .macro
+        clc
+        adc p4_xtra             ; Add extra cycles (page crossing, etc.)
+        adc ted_cycle_accum     ; Add to accumulated cycles
+        sta ted_cycle_accum
+        cmp #TED_CYCLES_PER_LINE
+        bcc _fc_skip\@
+        jsr finish_do_ted       ; Only call if we crossed scanline boundary
+_fc_skip\@:
+.endmacro
+
 
 ; ------------------------------------------------------------
 ; Z/N lookup table: entry = (val==0 ? P_Z : 0) | (val&$80 ? P_N : 0)
@@ -745,7 +761,8 @@ _skip_trace:
         sta p4_nmi_pending
         jsr cpu_take_nmi
         lda #7
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
         
 _step_chk_irq:
         lda p4_irq_pending
@@ -758,7 +775,8 @@ _step_chk_irq:
         sta p4_irq_pending
         jsr cpu_take_irq
         lda #7
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 _step_execute:
         lda #$00
@@ -821,12 +839,9 @@ _step_dispatch_lo:
 ; A = base cycle count on entry
 ; ============================================================
 finish_cycles:
-        ; Add extra cycles
+        ; Add extra cycles and accumulate (single CLC suffices since no overflow)
         clc
         adc p4_xtra
-        
-        ; Accumulate cycles
-        clc
         adc ted_cycle_accum
         sta ted_cycle_accum
         
@@ -898,8 +913,11 @@ _ill_d2:
         rts
 
 ; --- branch_do ---
+; Called when branch is taken. Sets p4_xtra to:
+;   1 = branch taken, no page cross
+;   2 = branch taken, page crossed
 branch_do:
-        lda #$00
+        lda #$01                ; Start with 1 (branch taken)
         sta p4_xtra
         lda p4_pc_lo
         clc
@@ -915,8 +933,7 @@ _br_hi_ok:
         lda p4_pc_hi
         cmp p4_addr_hi
         beq _br_same
-        lda #$01
-        sta p4_xtra
+        inc p4_xtra             ; Page crossed, increment to 2
 _br_same:
         lda p4_addr_lo
         sta p4_pc_lo
@@ -1297,7 +1314,8 @@ op_00:
         jsr P4MEM_ReadFast
         sta p4_pc_hi
         lda #7
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $01 ORA (zp,X)
 op_01:
@@ -1308,7 +1326,8 @@ op_01:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $05 ORA zp
 op_05:
@@ -1321,7 +1340,8 @@ op_05:
         ;jsr set_zn_a
         #set_zna
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $06 ASL zp
 op_06:
@@ -1340,7 +1360,8 @@ _op06_nc:
         lda LOW_RAM_BUFFER,x
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $08 PHP
 op_08:
@@ -1349,17 +1370,18 @@ op_08:
         sta p4_data
         jsr push_data
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $09 ORA #imm
 op_09:
         jsr fetch8
         ora p4_a
         sta p4_a
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $0A ASL A
 op_0a:
@@ -1380,7 +1402,8 @@ _op0a_nc:
         ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $0D ORA abs
 op_0d:
@@ -1391,7 +1414,8 @@ op_0d:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $0E ASL abs
 op_0e:
@@ -1414,7 +1438,8 @@ _op0e_nc:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $10 BPL
 op_10:
@@ -1424,17 +1449,15 @@ op_10:
         ;and #P_N
         ;bne _op10_nt
         jsr branch_do
-        lda p4_xtra
-        clc
-        adc #1
-        sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 _op10_nt:
         lda #0
         sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $11 ORA (zp),Y
 op_11:
@@ -1445,7 +1468,8 @@ op_11:
         ;jsr set_zn_a
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $15 ORA zp,X
 op_15:
@@ -1460,7 +1484,8 @@ op_15:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $16 ASL zp,X
 op_16:
@@ -1482,7 +1507,8 @@ _op16_nc:
         lda LOW_RAM_BUFFER,x
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $18 CLC
 op_18:
@@ -1490,7 +1516,8 @@ op_18:
         and #(~P_C) & $ff
         sta p4_p
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $19 ORA abs,Y
 op_19:
@@ -1501,7 +1528,8 @@ op_19:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $1D ORA abs,X
 op_1d:
@@ -1512,7 +1540,8 @@ op_1d:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $1E ASL abs,X
 op_1e:
@@ -1535,7 +1564,8 @@ _op1e_nc:
         ;jsr set_zn_a
         #set_zna
         lda #7
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $20 JSR
 op_20:
@@ -1560,7 +1590,8 @@ op_20:
         lda p4_vec_hi
         sta p4_pc_hi
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $21 AND (zp,X)
 op_21:
@@ -1571,7 +1602,8 @@ op_21:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $24 BIT zp
 op_24:
@@ -1599,7 +1631,8 @@ op_24:
         sta p4_p
 _op24_nz:
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $25 AND zp
 op_25:
@@ -1612,7 +1645,8 @@ op_25:
         ;jsr set_zn_a
         #set_zna
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $26 ROL zp
 op_26:
@@ -1643,7 +1677,8 @@ _op26_nc:
         lda LOW_RAM_BUFFER,x
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $28 PLP
 op_28:
@@ -1652,17 +1687,18 @@ op_28:
         ora #P_U
         sta p4_p
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $29 AND #imm
 op_29:
         jsr fetch8
         and p4_a
         sta p4_a
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $2A ROL A
 op_2a:
@@ -1688,7 +1724,8 @@ _op2a_nc:
         ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $2C BIT abs
 op_2c:
@@ -1714,7 +1751,8 @@ op_2c:
         sta p4_p
 _op2c_nz:
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $2D AND abs
 op_2d:
@@ -1725,7 +1763,8 @@ op_2d:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $2E ROL abs
 op_2e:
@@ -1754,7 +1793,8 @@ _op2e_nc:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $30 BMI
 op_30:
@@ -1764,17 +1804,15 @@ op_30:
         ;and #P_N
         ;beq _op30_nt
         jsr branch_do
-        lda p4_xtra
-        clc
-        adc #1
-        sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 _op30_nt:
         lda #0
         sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $31 AND (zp),Y
 op_31:
@@ -1785,7 +1823,8 @@ op_31:
         ;jsr set_zn_a
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $35 AND zp,X
 op_35:
@@ -1800,7 +1839,8 @@ op_35:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $36 ROL zp,X
 op_36:
@@ -1834,7 +1874,8 @@ _op36_nc:
         lda LOW_RAM_BUFFER,x
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $38 SEC
 op_38:
@@ -1842,7 +1883,8 @@ op_38:
         ora #P_C
         sta p4_p
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $39 AND abs,Y
 op_39:
@@ -1853,7 +1895,8 @@ op_39:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $3D AND abs,X
 op_3d:
@@ -1864,7 +1907,8 @@ op_3d:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $3E ROL abs,X
 op_3e:
@@ -1893,7 +1937,8 @@ _op3e_nc:
         ;jsr set_zn_a
         #set_zna
         lda #7
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $40 RTI
 op_40:
@@ -1906,7 +1951,8 @@ op_40:
         jsr pull_to_a
         sta p4_pc_hi
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $41 EOR (zp,X)
 op_41:
@@ -1917,7 +1963,8 @@ op_41:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $45 EOR zp
 op_45:
@@ -1930,7 +1977,8 @@ op_45:
         ;jsr set_zn_a
         #set_zna
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $46 LSR zp
 op_46:
@@ -1951,7 +1999,8 @@ _op46_nc:
         lda LOW_RAM_BUFFER,x
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $48 PHA
 op_48:
@@ -1959,17 +2008,18 @@ op_48:
         sta p4_data
         jsr push_data
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $49 EOR #imm
 op_49:
         jsr fetch8
         eor p4_a
         sta p4_a
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $4A LSR A
 op_4a:
@@ -1991,7 +2041,8 @@ _op4a_nc:
         ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $4C JMP abs
 op_4c:
@@ -2001,7 +2052,8 @@ op_4c:
         lda p4_addr_hi
         sta p4_pc_hi
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $4D EOR abs
 op_4d:
@@ -2012,7 +2064,8 @@ op_4d:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $4E LSR abs
 op_4e:
@@ -2036,7 +2089,8 @@ _op4e_nc:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $50 BVC
 op_50:
@@ -2046,17 +2100,15 @@ op_50:
         ;and #P_V
         ;bne _op50_nt
         jsr branch_do
-        lda p4_xtra
-        clc
-        adc #1
-        sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 _op50_nt:
         lda #0
         sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $51 EOR (zp),Y
 op_51:
@@ -2067,7 +2119,8 @@ op_51:
         ;jsr set_zn_a
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $55 EOR zp,X
 op_55:
@@ -2082,7 +2135,8 @@ op_55:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $56 LSR zp,X
 op_56:
@@ -2106,7 +2160,8 @@ _op56_nc:
         lda LOW_RAM_BUFFER,x
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $58 CLI
 op_58:
@@ -2114,7 +2169,8 @@ op_58:
         and #(~P_I) & $ff
         sta p4_p
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $59 EOR abs,Y
 op_59:
@@ -2125,7 +2181,8 @@ op_59:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $5D EOR abs,X
 op_5d:
@@ -2136,7 +2193,8 @@ op_5d:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $5E LSR abs,X
 op_5e:
@@ -2160,7 +2218,8 @@ _op5e_nc:
         ;jsr set_zn_a
         #set_zna
         lda #7
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $60 RTS
 op_60:
@@ -2170,7 +2229,8 @@ op_60:
         sta p4_pc_hi
         inw p4_pc_lo            ; 16-bit increment
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $61 ADC (zp,X)
 op_61:
@@ -2178,7 +2238,8 @@ op_61:
         jsr P4MEM_ReadFast
         jsr do_adc
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $65 ADC zp
 op_65:
@@ -2188,7 +2249,8 @@ op_65:
         lda LOW_RAM_BUFFER,x
         jsr do_adc
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $66 ROR zp
 op_66:
@@ -2227,7 +2289,8 @@ _op66_nc:
         lda LOW_RAM_BUFFER,x
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $68 PLA
 op_68:
@@ -2236,14 +2299,16 @@ op_68:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $69 ADC #imm
 op_69:
         jsr fetch8
         jsr do_adc
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $6A ROR A
 op_6a:
@@ -2276,7 +2341,8 @@ _op6a_nc:
         ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $6C JMP (ind)
 op_6c:
@@ -2287,7 +2353,8 @@ op_6c:
         lda p4_addr_hi
         sta p4_pc_hi
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $6D ADC abs
 op_6d:
@@ -2295,7 +2362,8 @@ op_6d:
         jsr P4MEM_ReadFast
         jsr do_adc
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $6E ROR abs
 op_6e:
@@ -2331,7 +2399,8 @@ _op6e_nc:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $70 BVS
 op_70:
@@ -2341,17 +2410,15 @@ op_70:
         ;and #P_V
         ;beq _op70_nt
         jsr branch_do
-        lda p4_xtra
-        clc
-        adc #1
-        sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 _op70_nt:
         lda #0
         sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $71 ADC (zp),Y
 op_71:
@@ -2359,7 +2426,8 @@ op_71:
         jsr P4MEM_ReadFast
         jsr do_adc
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $75 ADC zp,X
 op_75:
@@ -2371,7 +2439,8 @@ op_75:
         lda LOW_RAM_BUFFER,x
         jsr do_adc
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $76 ROR zp,X
 op_76:
@@ -2413,7 +2482,8 @@ _op76_nc:
         lda LOW_RAM_BUFFER,x
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $78 SEI
 op_78:
@@ -2421,7 +2491,8 @@ op_78:
         ora #P_I
         sta p4_p
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $79 ADC abs,Y
 op_79:
@@ -2429,7 +2500,8 @@ op_79:
         jsr P4MEM_ReadFast
         jsr do_adc
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $7D ADC abs,X
 op_7d:
@@ -2437,7 +2509,8 @@ op_7d:
         jsr P4MEM_ReadFast
         jsr do_adc
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $7E ROR abs,X
 op_7e:
@@ -2473,7 +2546,8 @@ _op7e_nc:
         ;jsr set_zn_a
         #set_zna
         lda #7
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $81 STA (zp,X)
 op_81:
@@ -2482,7 +2556,8 @@ op_81:
         sta p4_data
         jsr P4MEM_Write
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $84 STY zp
 op_84:
@@ -2492,7 +2567,8 @@ op_84:
         lda p4_y
         sta LOW_RAM_BUFFER,x
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 
 ; $85 STA zp
@@ -2502,7 +2578,8 @@ op_85:
         lda p4_a
         sta LOW_RAM_BUFFER,x
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $86 STX zp  
 op_86:
@@ -2511,25 +2588,26 @@ op_86:
         lda p4_x
         sta LOW_RAM_BUFFER,x
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $88 DEY
 op_88:
         dec p4_y
         lda p4_y
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $8A TXA
 op_8a:
         lda p4_x
         sta p4_a
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $8C STY abs
 op_8c:
@@ -2538,7 +2616,8 @@ op_8c:
         sta p4_data
         jsr P4MEM_Write
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $8D STA abs
 op_8d:
@@ -2568,7 +2647,8 @@ _op8d_not_kbd_cli:
 _op8d_not_fd30:
         jsr P4MEM_Write
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $8E STX abs
 op_8e:
@@ -2577,7 +2657,8 @@ op_8e:
         sta p4_data
         jsr P4MEM_Write
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $90 BCC
 op_90:
@@ -2590,17 +2671,15 @@ op_90:
         ;and #P_C
         ;bne _op90_nt
         jsr branch_do
-        lda p4_xtra
-        clc
-        adc #1
-        sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 _op90_nt:
         lda #0
         sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $91 STA (zp),Y
 op_91:
@@ -2609,7 +2688,8 @@ op_91:
         sta p4_data
         jsr P4MEM_Write
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $94 STY zp,X
 op_94:
@@ -2621,7 +2701,8 @@ op_94:
         lda p4_y
         sta LOW_RAM_BUFFER,x
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $95 STA zp,X
 op_95:
@@ -2633,7 +2714,8 @@ op_95:
         lda p4_a
         sta LOW_RAM_BUFFER,x
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $96 STX zp,Y
 op_96:
@@ -2645,16 +2727,17 @@ op_96:
         lda p4_x
         sta LOW_RAM_BUFFER,x
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $98 TYA
 op_98:
         lda p4_y
         sta p4_a
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $99 STA abs,Y
 op_99:
@@ -2663,14 +2746,16 @@ op_99:
         sta p4_data
         jsr P4MEM_Write
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $9A TXS
 op_9a:
         lda p4_x
         sta p4_sp
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $9D STA abs,X
 op_9d:
@@ -2679,16 +2764,17 @@ op_9d:
         sta p4_data
         jsr P4MEM_Write
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $A0 LDY #imm
 op_a0:
         jsr fetch8
         sta p4_y
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $A1 LDA (zp,X)
 op_a1:
@@ -2698,16 +2784,17 @@ op_a1:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $A2 LDX #imm
 op_a2:
         jsr fetch8
         sta p4_x
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $A4 LDY zp
 op_a4:
@@ -2716,10 +2803,10 @@ op_a4:
         tax
         lda LOW_RAM_BUFFER,x
         sta p4_y
-        ;jsr set_zn_a
         #set_zna
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $A5 LDA zp
 op_a5:
@@ -2728,10 +2815,10 @@ op_a5:
         tax
         lda LOW_RAM_BUFFER,x             ; Direct read from LOW_RAM_BUFFER
         sta p4_a
-        ;jsr set_zn_a
         #set_zna
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $A6 LDX zp
 op_a6:
@@ -2740,37 +2827,37 @@ op_a6:
         tax
         lda LOW_RAM_BUFFER,x
         sta p4_x
-        ;jsr set_zn_a
         #set_zna
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $A8 TAY
 op_a8:
         lda p4_a
         sta p4_y
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $A9 LDA #imm
 op_a9:
         jsr fetch8
         sta p4_a
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $AA TAX
 op_aa:
         lda p4_a
         sta p4_x
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $AC LDY abs
 op_ac:
@@ -2780,7 +2867,8 @@ op_ac:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $AD LDA abs
 op_ad:
@@ -2790,7 +2878,8 @@ op_ad:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $AE LDX abs
 op_ae:
@@ -2800,7 +2889,8 @@ op_ae:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $B0 BCS
 op_b0:
@@ -2810,17 +2900,15 @@ op_b0:
         ;and #P_C
         ;beq _opb0_nt
         jsr branch_do
-        lda p4_xtra
-        clc
-        adc #1
-        sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 _opb0_nt:
         lda #0
         sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $B1 LDA (zp),Y
 op_b1:
@@ -2830,7 +2918,8 @@ op_b1:
         ;jsr set_zn_a
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $B4 LDY zp,X
 op_b4:
@@ -2844,7 +2933,8 @@ op_b4:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $B5 LDA zp,X
 op_b5:
@@ -2858,7 +2948,8 @@ op_b5:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $B6 LDX zp,Y
 op_b6:
@@ -2872,7 +2963,8 @@ op_b6:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $B8 CLV
 op_b8:
@@ -2880,7 +2972,8 @@ op_b8:
         and #(~P_V) & $ff
         sta p4_p
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $B9 LDA abs,Y
 op_b9:
@@ -2890,16 +2983,17 @@ op_b9:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $BA TSX
 op_ba:
         lda p4_sp
         sta p4_x
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $BC LDY abs,X
 op_bc:
@@ -2909,7 +3003,8 @@ op_bc:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $BD LDA abs,X
 op_bd:
@@ -2919,7 +3014,8 @@ op_bd:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $BE LDX abs,Y
 op_be:
@@ -2929,14 +3025,16 @@ op_be:
         ;jsr set_zn_a
         #set_zna
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $C0 CPY #imm
 op_c0:
         jsr fetch8
         jsr do_cpy
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $C1 CMP (zp,X)
 op_c1:
@@ -2944,7 +3042,8 @@ op_c1:
         jsr P4MEM_ReadFast
         jsr do_cmp
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $C4 CPY zp
 op_c4:
@@ -2954,7 +3053,8 @@ op_c4:
         lda LOW_RAM_BUFFER,x
         jsr do_cpy
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $C5 CMP zp
 op_c5:
@@ -2964,7 +3064,8 @@ op_c5:
         lda LOW_RAM_BUFFER,x
         jsr do_cmp
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $C6 DEC zp
 op_c6:
@@ -2976,32 +3077,34 @@ op_c6:
         ;jsr set_zn_a
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $C8 INY
 op_c8:
         inc p4_y
         lda p4_y
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $C9 CMP #imm
 op_c9:
         jsr fetch8
         jsr do_cmp
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $CA DEX
 op_ca:
         dec p4_x
         lda p4_x
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $CC CPY abs
 op_cc:
@@ -3009,7 +3112,8 @@ op_cc:
         jsr P4MEM_ReadFast
         jsr do_cpy
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $CD CMP abs
 op_cd:
@@ -3017,7 +3121,8 @@ op_cd:
         jsr P4MEM_ReadFast
         jsr do_cmp
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $CE DEC abs
 op_ce:
@@ -3031,7 +3136,8 @@ op_ce:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $D0 BNE
 op_d0:
@@ -3041,17 +3147,15 @@ op_d0:
         ;and #P_Z
         ;bne _opd0_nt
         jsr branch_do
-        lda p4_xtra
-        clc
-        adc #1
-        sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 _opd0_nt:
         lda #0
         sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $D1 CMP (zp),Y
 op_d1:
@@ -3059,7 +3163,8 @@ op_d1:
         jsr P4MEM_ReadFast
         jsr do_cmp
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $D5 CMP zp,X
 op_d5:
@@ -3071,7 +3176,8 @@ op_d5:
         lda LOW_RAM_BUFFER,x
         jsr do_cmp
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $D6 DEC zp,X
 op_d6:
@@ -3085,7 +3191,8 @@ op_d6:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $D8 CLD
 op_d8:
@@ -3093,7 +3200,8 @@ op_d8:
         and #(~P_D) & $ff
         sta p4_p
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $D9 CMP abs,Y
 op_d9:
@@ -3101,7 +3209,8 @@ op_d9:
         jsr P4MEM_ReadFast
         jsr do_cmp
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $DD CMP abs,X
 op_dd:
@@ -3109,7 +3218,8 @@ op_dd:
         jsr P4MEM_ReadFast
         jsr do_cmp
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $DE DEC abs,X
 op_de:
@@ -3123,14 +3233,16 @@ op_de:
         ;jsr set_zn_a
         #set_zna
         lda #7
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $E0 CPX #imm
 op_e0:
         jsr fetch8
         jsr do_cpx
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $E1 SBC (zp,X)
 op_e1:
@@ -3138,7 +3250,8 @@ op_e1:
         jsr P4MEM_ReadFast
         jsr do_sbc
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $E4 CPX zp
 op_e4:
@@ -3148,7 +3261,8 @@ op_e4:
         lda LOW_RAM_BUFFER,x
         jsr do_cpx
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $E5 SBC zp
 op_e5:
@@ -3158,7 +3272,8 @@ op_e5:
         lda LOW_RAM_BUFFER,x
         jsr do_sbc
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $E6 INC zp
 op_e6:
@@ -3170,28 +3285,31 @@ op_e6:
         ;jsr set_zn_a
         #set_zna
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $E8 INX
 op_e8:
         inc p4_x
         lda p4_x
-        ;jsr set_zn_a
         #set_zna
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $E9 SBC #imm
 op_e9:
         jsr fetch8
         jsr do_sbc
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $EA NOP
 op_ea:
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $EC CPX abs
 op_ec:
@@ -3199,7 +3317,8 @@ op_ec:
         jsr P4MEM_ReadFast
         jsr do_cpx
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $ED SBC abs
 op_ed:
@@ -3207,7 +3326,8 @@ op_ed:
         jsr P4MEM_ReadFast
         jsr do_sbc
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $EE INC abs
 op_ee:
@@ -3221,7 +3341,8 @@ op_ee:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $F0 BEQ
 op_f0:
@@ -3231,17 +3352,15 @@ op_f0:
         ;and #P_Z
         ;beq _opf0_nt
         jsr branch_do
-        lda p4_xtra
-        clc
-        adc #1
-        sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 _opf0_nt:
         lda #0
         sta p4_xtra
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $F1 SBC (zp),Y
 op_f1:
@@ -3249,7 +3368,8 @@ op_f1:
         jsr P4MEM_ReadFast
         jsr do_sbc
         lda #5
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $F5 SBC zp,X
 op_f5:
@@ -3261,7 +3381,8 @@ op_f5:
         lda LOW_RAM_BUFFER,x
         jsr do_sbc
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $F6 INC zp,X
 op_f6:
@@ -3275,7 +3396,8 @@ op_f6:
         ;jsr set_zn_a
         #set_zna
         lda #6
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $F8 SED
 op_f8:
@@ -3283,7 +3405,8 @@ op_f8:
         ora #P_D
         sta p4_p
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $F9 SBC abs,Y
 op_f9:
@@ -3291,7 +3414,8 @@ op_f9:
         jsr P4MEM_ReadFast
         jsr do_sbc
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $FD SBC abs,X
 op_fd:
@@ -3299,7 +3423,8 @@ op_fd:
         jsr P4MEM_ReadFast
         jsr do_sbc
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; $FE INC abs,X
 op_fe:
@@ -3313,7 +3438,8 @@ op_fe:
         ;jsr set_zn_a
         #set_zna
         lda #7
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; ============================================================
 ; Illegal opcodes
@@ -3326,14 +3452,16 @@ op_44:
 op_64:
         jsr fetch8              ; Skip the ZP byte
         lda #3
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; NOP abs (3 bytes) - $0C
 op_0c:
         jsr fetch8              ; Skip low byte
         jsr fetch8              ; Skip high byte
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; NOP abs,X (3 bytes) - $1C, $3C, $5C, $7C, $DC, $FC
 op_1c:
@@ -3345,7 +3473,8 @@ op_fc:
         jsr fetch8              ; Skip low byte
         jsr fetch8              ; Skip high byte
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; NOP zp,X (2 bytes) - $14, $34, $54, $74, $D4, $F4
 op_14:
@@ -3356,7 +3485,8 @@ op_d4:
 op_f4:
         jsr fetch8              ; Skip the ZP byte
         lda #4
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; NOP implied (1 byte) - $1A, $3A, $5A, $7A, $DA, $FA
 op_1a:
@@ -3366,7 +3496,8 @@ op_7a:
 op_da:
 op_fa:
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; NOP immediate (2 bytes) - $80, $82, $89, $C2, $E2
 op_80:
@@ -3376,7 +3507,8 @@ op_c2:
 op_e2:
         jsr fetch8              ; Skip immediate byte
         lda #2
-        jmp finish_cycles
+        #finish_cycles_inline
+        rts
 
 ; JAM/KIL - halt CPU (these will crash if hit)
 op_02:
